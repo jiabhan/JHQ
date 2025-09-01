@@ -1,4 +1,3 @@
-# jrpqlib/CMakeLists.txt
 add_library(${LIBRARY_NAME} STATIC
         IndexJHQ.cpp
         IndexJHQ.h
