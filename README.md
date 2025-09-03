@@ -135,7 +135,7 @@ Evaluation datasets used in the paper:
 
 | Dataset             | Dimensions | Size | Source |
 |---------------------|------------|------|--------|
-| OpenAI3-1536        | 1024       | 1M   | [HuggingFace](https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M) |
+| OpenAI3-1536        | 1536       | 1M   | [HuggingFace](https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M) |
 | OpenAI3-3072        | 3072       | 1M   | [HuggingFace](https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-large-3072-1M) |
 | Vogue-768           | 768        | 933K | [HuggingFace](https://huggingface.co/datasets/tonyassi/vogue933k-embeddings) |
 | Arxiv-Abstracts-768 | 768        | 2.3M | [HuggingFace](https://huggingface.co/datasets/macrocosm/arxiv_abstracts) |
