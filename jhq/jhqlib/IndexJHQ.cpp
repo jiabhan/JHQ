@@ -20,6 +20,7 @@
 #include <faiss/impl/index_read_utils.h>
 #include <faiss/impl/io_macros.h>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 
@@ -91,6 +92,51 @@ float fvec_L2sqr_dispatch(const float* x, const float* y, size_t d)
 #else
     return faiss::fvec_L2sqr(x, y, d);
 #endif
+}
+
+float compute_cross_term_from_codes(
+    const IndexJHQ& index,
+    const uint8_t* primary_codes,
+    const uint8_t* residual_codes,
+    size_t residual_subspace_stride,
+    size_t residual_level_stride)
+{
+    if (!primary_codes || !residual_codes || index.num_levels <= 1) {
+        return 0.0f;
+    }
+
+    float dot = 0.0f;
+
+    for (int m = 0; m < index.M; ++m) {
+        const auto& centroids = index.codewords[m][0];
+        if (centroids.empty()) {
+            continue;
+        }
+
+        const int num_centroids = static_cast<int>(centroids.size() / index.Ds);
+        const uint32_t centroid_id = std::min<uint32_t>(
+            primary_codes[m], static_cast<uint32_t>(std::max(0, num_centroids - 1)));
+        const float* centroid_ptr = centroids.data() + static_cast<size_t>(centroid_id) * index.Ds;
+
+        const uint8_t* subspace_residual = residual_codes + m * residual_subspace_stride;
+
+        for (int d = 0; d < index.Ds; ++d) {
+            float residual_value = 0.0f;
+            for (int level = 1; level < index.num_levels; ++level) {
+                const auto& codebook = index.scalar_codebooks[m][level - 1];
+                if (codebook.empty()) {
+                    continue;
+                }
+                const uint8_t scalar_id = subspace_residual[(level - 1) * residual_level_stride + d];
+                const size_t max_idx = codebook.size() - 1;
+                const size_t safe_idx = std::min(static_cast<size_t>(scalar_id), max_idx);
+                residual_value += codebook[safe_idx];
+            }
+            dot += centroid_ptr[d] * residual_value;
+        }
+    }
+
+    return 2.0f * dot;
 }
 
 PreDecodedCodes::PreDecodedCodes()
@@ -195,12 +241,20 @@ IndexJHQ::IndexJHQ(
     this->d = d;
     this->metric_type = metric;
 
-
+    if (verbose) {
+        std::cout << "Initializing JHQ: d=" << d << ", M=" << M
+                  << ", levels=" << num_levels << std::endl;
+    }
 
     validate_parameters();
     initialize_data_structures();
     compute_code_size();
 
+    if (verbose) {
+        std::cout << "JHQ initialized: code_size=" << code_size
+                  << " bytes, compression=" << (32.0f * d) / (8.0f * code_size)
+                  << "x" << std::endl;
+    }
 }
 
 IndexJHQ::IndexJHQ(const IndexJHQ& other)
@@ -217,7 +271,11 @@ IndexJHQ::IndexJHQ(const IndexJHQ& other)
     , is_rotation_trained(other.is_rotation_trained)
     , codewords(other.codewords)
     , scalar_codebooks(other.scalar_codebooks)
+    , residual_pq_dirty_(true)
 {
+    if (other.residual_pq_) {
+        residual_pq_ = std::make_unique<ProductQuantizer>(*other.residual_pq_);
+    }
 }
 
 IndexJHQ& IndexJHQ::operator=(const IndexJHQ& other)
@@ -236,6 +294,12 @@ IndexJHQ& IndexJHQ::operator=(const IndexJHQ& other)
         is_rotation_trained = other.is_rotation_trained;
         codewords = other.codewords;
         scalar_codebooks = other.scalar_codebooks;
+        residual_pq_dirty_ = true;
+        if (other.residual_pq_) {
+            residual_pq_ = std::make_unique<ProductQuantizer>(*other.residual_pq_);
+        } else {
+            residual_pq_.reset();
+        }
     }
     return *this;
 }
@@ -283,6 +347,9 @@ void IndexJHQ::initialize_data_structures()
             }
         }
     }
+
+    residual_pq_dirty_ = true;
+    residual_pq_.reset();
 }
 
 void IndexJHQ::compute_code_size()
@@ -310,6 +377,9 @@ bool IndexJHQ::is_trained_() const
 
 void IndexJHQ::train(idx_t n, const float* x)
 {
+    if (verbose) {
+        std::cout << "\n=== Training JHQ on " << n << " vectors ===" << std::endl;
+    }
 
     FAISS_THROW_IF_NOT_MSG(n > 0, "Training set cannot be empty");
     FAISS_THROW_IF_NOT_MSG(x != nullptr, "Training data cannot be null");
@@ -370,6 +440,7 @@ void IndexJHQ::train(idx_t n, const float* x)
 
     is_trained = true;
     initialize_memory_layout();
+    mark_residual_tables_dirty();
 
     if (verbose) {
         std::cout << "=== Training Complete ===" << std::endl;
@@ -397,6 +468,8 @@ void IndexJHQ::train_subspace_quantizers(
             update_residuals_after_level(subspace_idx, level, n, current_residuals.data());
         }
     }
+
+    mark_residual_tables_dirty();
 }
 
 void IndexJHQ::train_primary_level(
@@ -461,14 +534,23 @@ void IndexJHQ::train_residual_level(
     int K)
 {
     std::vector<float>& scalar_codebook = scalar_codebooks[subspace_idx][level - 1];
+    if (K <= 0) {
+        scalar_codebook.clear();
+        mark_residual_tables_dirty();
+        return;
+    }
+
     scalar_codebook.resize(K);
 
-    if (use_analytical_init && K > 2) {
-        const size_t max_samples = std::min(static_cast<size_t>(n * Ds), static_cast<size_t>(10000));
+    const size_t total_values = static_cast<size_t>(n) * static_cast<size_t>(Ds);
+
+    if (total_values == 0) {
+        std::fill(scalar_codebook.begin(), scalar_codebook.end(), 0.0f);
+    } else if (use_analytical_init && K > 2) {
+        const size_t max_samples = std::min(total_values, static_cast<size_t>(10000));
         std::vector<float> samples;
         samples.reserve(max_samples);
 
-        const size_t total_values = n * Ds;
         const size_t stride = std::max(static_cast<size_t>(1), total_values / max_samples);
 
         for (size_t i = 0; i < total_values; i += stride) {
@@ -485,8 +567,6 @@ void IndexJHQ::train_residual_level(
             scalar_codebook[k] = samples[idx];
         }
     } else {
-        const size_t total_values = n * Ds;
-
 #ifdef __AVX512F__
         __m512 vmin = _mm512_set1_ps(residuals[0]);
         __m512 vmax = _mm512_set1_ps(residuals[0]);
@@ -523,6 +603,8 @@ void IndexJHQ::train_residual_level(
             }
         }
     }
+
+    mark_residual_tables_dirty();
 }
 
 void IndexJHQ::update_residuals_after_level(
@@ -792,6 +874,10 @@ void IndexJHQ::invalidate_memory_layout()
 {
     if (!memory_layout_initialized_) {
         return;
+    }
+
+    if (verbose) {
+        std::cout << "Invalidating and clearing optimized JHQ memory layout." << std::endl;
     }
 
     separated_codes_.clear();
@@ -1391,14 +1477,30 @@ void IndexJHQ::compute_primary_distance_tables_flat(
     int K0,
     float* distance_table_flat) const {
 
-    constexpr int SUBSPACE_BLOCK = 8;
-    constexpr int CENTROID_BLOCK = 32;
+    if (num_levels == 1) {
+        for (int m = 0; m < M; ++m) {
+            const float* query_subspace = query_rotated + m * Ds;
+            const std::vector<float>& centroids = codewords[m][0];
+            float* table_m_ptr = distance_table_flat + (size_t)m * K0;
+            compute_subspace_distances_simd(
+                query_subspace,
+                centroids.data(),
+                table_m_ptr,
+                K0,
+                Ds);
+        }
+        return;
+    }
+
+    constexpr int SUBSPACE_BLOCK = 8;  // Increased block size
+    constexpr int CENTROID_BLOCK = 32; // Increased for better vectorization
 
 #ifdef __AVX512F__
-
+    // AVX512 optimized version
     for (int m_block = 0; m_block < M; m_block += SUBSPACE_BLOCK) {
         const int m_end = std::min(m_block + SUBSPACE_BLOCK, M);
 
+        // Prefetch next block
         if (m_block + SUBSPACE_BLOCK < M) {
             const float* next_query = query_rotated + (m_block + SUBSPACE_BLOCK) * Ds;
             _mm_prefetch(reinterpret_cast<const char*>(next_query), _MM_HINT_T0);
@@ -1411,18 +1513,22 @@ void IndexJHQ::compute_primary_distance_tables_flat(
 
             int k = 0;
 
+            // Process centroids in blocks of 32 for better cache usage
             for (; k + CENTROID_BLOCK <= K0; k += CENTROID_BLOCK) {
+                // Prefetch next centroid block
                 if (k + CENTROID_BLOCK < K0) {
                     const float* next_centroids = centroids.data() + (k + CENTROID_BLOCK) * Ds;
                     _mm_prefetch(reinterpret_cast<const char*>(next_centroids), _MM_HINT_T1);
                     _mm_prefetch(reinterpret_cast<const char*>(next_centroids + 16), _MM_HINT_T1);
                 }
 
+                // Process 16 centroids at once, twice per block
                 for (int sub_block = 0; sub_block < 2; ++sub_block) {
                     const int centroid_offset = k + sub_block * 16;
                     __m512 distances = _mm512_setzero_ps();
 
                     if (Ds >= 16) {
+                        // Vectorize across dimensions when Ds is large enough
                         int d = 0;
                         for (; d + 15 < Ds; d += 16) {
                             __m512 query_vec = _mm512_loadu_ps(&query_subspace[d]);
@@ -1433,12 +1539,14 @@ void IndexJHQ::compute_primary_distance_tables_flat(
                                 __m512 diff = _mm512_sub_ps(query_vec, centroid_vec);
                                 __m512 sq_diff = _mm512_mul_ps(diff, diff);
 
+                                // Horizontal add across dimensions for this centroid
                                 float centroid_contribution = _mm512_reduce_add_ps(sq_diff);
                                 distances = _mm512_mask_add_ps(distances, (1 << i), distances,
                                                              _mm512_set1_ps(centroid_contribution));
                             }
                         }
 
+                        // Handle remaining dimensions
                         for (; d < Ds; ++d) {
                             float query_val = query_subspace[d];
                             for (int i = 0; i < 16; ++i) {
@@ -1449,6 +1557,7 @@ void IndexJHQ::compute_primary_distance_tables_flat(
                             }
                         }
                     } else {
+                        // Original approach for smaller Ds
                         for (int d = 0; d < Ds; ++d) {
                             __m512 query_val = _mm512_set1_ps(query_subspace[d]);
 
@@ -1472,6 +1581,7 @@ void IndexJHQ::compute_primary_distance_tables_flat(
                 }
             }
 
+            // Handle remaining centroids
             for (; k < K0; ++k) {
                 table_m_ptr[k] = jhq_internal::fvec_L2sqr_dispatch(
                     query_subspace, centroids.data() + k * Ds, Ds);
@@ -1480,6 +1590,7 @@ void IndexJHQ::compute_primary_distance_tables_flat(
     }
 
 #elif defined(__AVX2__)
+    // Enhanced AVX2 version
     for (int m_block = 0; m_block < M; m_block += SUBSPACE_BLOCK) {
         const int m_end = std::min(m_block + SUBSPACE_BLOCK, M);
 
@@ -1490,7 +1601,9 @@ void IndexJHQ::compute_primary_distance_tables_flat(
 
             int k = 0;
 
+            // Process 16 centroids at once (2 AVX2 vectors)
             for (; k + 16 <= K0; k += 16) {
+                // First 8 centroids
                 __m256 distances1 = _mm256_setzero_ps();
                 for (int d = 0; d < Ds; ++d) {
                     __m256 query_val = _mm256_set1_ps(query_subspace[d]);
@@ -1506,6 +1619,7 @@ void IndexJHQ::compute_primary_distance_tables_flat(
                 }
                 _mm256_storeu_ps(&table_m_ptr[k], distances1);
 
+                // Second 8 centroids
                 __m256 distances2 = _mm256_setzero_ps();
                 for (int d = 0; d < Ds; ++d) {
                     __m256 query_val = _mm256_set1_ps(query_subspace[d]);
@@ -1522,6 +1636,7 @@ void IndexJHQ::compute_primary_distance_tables_flat(
                 _mm256_storeu_ps(&table_m_ptr[k + 8], distances2);
             }
 
+            // Handle remaining centroids
             for (; k < K0; ++k) {
                 table_m_ptr[k] = jhq_internal::fvec_L2sqr_dispatch(
                     query_subspace, centroids.data() + k * Ds, Ds);
@@ -1529,12 +1644,14 @@ void IndexJHQ::compute_primary_distance_tables_flat(
         }
     }
 #else
+    // Scalar version with better unrolling
     for (int m = 0; m < M; ++m) {
         const float* query_subspace = query_rotated + m * Ds;
         const std::vector<float>& centroids = codewords[m][0];
         float* table_m_ptr = distance_table_flat + (size_t)m * K0;
 
         int k = 0;
+        // Unroll by 4 for better instruction-level parallelism
         for (; k + 3 < K0; k += 4) {
             table_m_ptr[k] = jhq_internal::fvec_L2sqr_dispatch(
                 query_subspace, centroids.data() + k * Ds, Ds);
@@ -1565,6 +1682,34 @@ void IndexJHQ::compute_residual_distance_tables(
         return;
     }
 
+    const ProductQuantizer* residual_pq = get_residual_product_quantizer();
+    if (residual_pq) {
+        const size_t total_subquantizers = residual_pq->M;
+        const int K_res = 1 << level_bits[1];
+
+        flat_tables.resize(total_subquantizers * K_res);
+        level_offsets.assign(num_levels, 0);
+        for (int level = 1; level < num_levels; ++level) {
+            level_offsets[level] = static_cast<size_t>(level - 1) * M * Ds * K_res;
+        }
+
+        std::vector<float> query_for_residual(total_subquantizers);
+        size_t offset = 0;
+        for (int level = 1; level < num_levels; ++level) {
+            for (int m = 0; m < M; ++m) {
+                const float* query_subspace = query_rotated + m * Ds;
+                std::memcpy(query_for_residual.data() + offset,
+                    query_subspace,
+                    Ds * sizeof(float));
+                offset += Ds;
+            }
+        }
+
+        residual_pq->compute_distance_table(
+            query_for_residual.data(), flat_tables.data());
+        return;
+    }
+
     level_offsets.assign(num_levels, 0);
     size_t total_size = 0;
     for (int level = 1; level < num_levels; ++level) {
@@ -1587,14 +1732,16 @@ void IndexJHQ::compute_residual_distance_tables(
 
                 if (d + 4 < Ds) {
                     for (int d_pf = d + 4; d_pf < std::min(d + 8, Ds); ++d_pf) {
-                        size_t pf_idx = current_level_offset + (size_t)m * Ds * K + (size_t)d_pf * K;
+                        size_t pf_idx = current_level_offset +
+                            (size_t)m * Ds * K + (size_t)d_pf * K;
                         _mm_prefetch(&flat_tables[pf_idx], _MM_HINT_T0);
                     }
                 }
 
                 for (int d_inner = d; d_inner < d_end; ++d_inner) {
                     const float query_val = query_subspace[d_inner];
-                    size_t table_start_idx = current_level_offset + (size_t)m * Ds * K + (size_t)d_inner * K;
+                    size_t table_start_idx = current_level_offset +
+                        (size_t)m * Ds * K + (size_t)d_inner * K;
                     float* table_ptr = flat_tables.data() + table_start_idx;
 
 #ifdef __AVX512F__
@@ -1645,6 +1792,41 @@ void IndexJHQ::compute_residual_distance_tables(
     }
 }
 
+const ProductQuantizer* IndexJHQ::get_residual_product_quantizer() const
+{
+    if (num_levels != 2) {
+        return nullptr;
+    }
+
+    const int bits = level_bits[1];
+    const size_t K = static_cast<size_t>(1) << bits;
+
+    for (int m = 0; m < M; ++m) {
+        if (scalar_codebooks[m][0].size() != K) {
+            return nullptr;
+        }
+    }
+
+    if (!residual_pq_ || residual_pq_dirty_) {
+        const size_t total_subquantizers = static_cast<size_t>(M) * Ds;
+        residual_pq_ = std::make_unique<ProductQuantizer>(
+            total_subquantizers, total_subquantizers, bits);
+
+        for (int m = 0; m < M; ++m) {
+            const auto& codebook = scalar_codebooks[m][0];
+            for (int d = 0; d < Ds; ++d) {
+                const size_t sub_idx = static_cast<size_t>(m) * Ds + d;
+                float* centroid_ptr = residual_pq_->get_centroids(sub_idx, 0);
+                std::memcpy(centroid_ptr, codebook.data(), K * sizeof(float));
+            }
+        }
+
+        residual_pq_dirty_ = false;
+    }
+
+    return residual_pq_.get();
+}
+
 void IndexJHQ::compute_primary_distances_flat(
     const float* distance_table_flat,
     int K0,
@@ -1665,10 +1847,11 @@ void IndexJHQ::compute_primary_distances(
     constexpr int VECTOR_BATCH_SIZE = 512; // Larger batch for better cache usage
     constexpr int PREFETCH_DISTANCE = 64;
 
-#pragma omp parallel for schedule(static) if (ntotal > 5000)
+#pragma omp parallel for schedule(static) if (ntotal > 5000) // Lower threshold
     for (idx_t batch_start = 0; batch_start < ntotal; batch_start += VECTOR_BATCH_SIZE) {
         const idx_t batch_end = std::min(ntotal, batch_start + VECTOR_BATCH_SIZE);
 
+        // Enhanced prefetching strategy
         for (idx_t i = batch_start; i < batch_end; i += PREFETCH_DISTANCE) {
             const idx_t prefetch_end = std::min(batch_end, i + PREFETCH_DISTANCE * 2);
             for (idx_t j = i; j < prefetch_end; j += 8) {
@@ -1684,6 +1867,7 @@ void IndexJHQ::compute_primary_distances(
 
 #ifdef __AVX512F__
             if (M >= 64) {
+                // Ultra-wide vectorization for very large M
                 __m512 acc[4] = {
                     _mm512_setzero_ps(), _mm512_setzero_ps(),
                     _mm512_setzero_ps(), _mm512_setzero_ps()
@@ -1709,11 +1893,13 @@ void IndexJHQ::compute_primary_distances(
                     }
                 }
 
+                // Combine all accumulators
                 __m512 combined1 = _mm512_add_ps(acc[0], acc[1]);
                 __m512 combined2 = _mm512_add_ps(acc[2], acc[3]);
                 __m512 final_combined = _mm512_add_ps(combined1, combined2);
                 total_distance += _mm512_reduce_add_ps(final_combined);
 
+                // Handle remaining subspaces
                 for (; m < M; ++m) {
                     uint32_t code_val = primary_codes[m];
                     code_val = std::min(code_val, static_cast<uint32_t>(K0 - 1));
@@ -1721,11 +1907,13 @@ void IndexJHQ::compute_primary_distances(
                 }
 
             } else if (M >= 32) {
+                // Medium M optimization
                 __m512 acc1 = _mm512_setzero_ps();
                 __m512 acc2 = _mm512_setzero_ps();
 
                 int m = 0;
                 for (; m + 31 < M; m += 32) {
+                    // First 16
                     __m128i codes1_128 = _mm_loadu_si128(
                         reinterpret_cast<const __m128i*>(&primary_codes[m]));
                     __m512i codes1_512 = _mm512_cvtepu8_epi32(codes1_128);
@@ -1740,6 +1928,7 @@ void IndexJHQ::compute_primary_distances(
                     __m512 dists1 = _mm512_i32gather_ps(indices1, distance_table_flat, 4);
                     acc1 = _mm512_add_ps(acc1, dists1);
 
+                    // Second 16
                     __m128i codes2_128 = _mm_loadu_si128(
                         reinterpret_cast<const __m128i*>(&primary_codes[m + 16]));
                     __m512i codes2_512 = _mm512_cvtepu8_epi32(codes2_128);
@@ -1764,6 +1953,7 @@ void IndexJHQ::compute_primary_distances(
                 }
 
             } else if (M >= 16) {
+                // Original AVX512 path
                 __m512 acc = _mm512_setzero_ps();
                 int m = 0;
 
@@ -1792,6 +1982,7 @@ void IndexJHQ::compute_primary_distances(
                 }
             } else
 #elif defined(__AVX2__)
+            // Enhanced AVX2 path similar to AVX512 but with 8-wide vectors
             if (M >= 32) {
                 __m256 acc[4] = {
                     _mm256_setzero_ps(), _mm256_setzero_ps(),
@@ -1819,6 +2010,7 @@ void IndexJHQ::compute_primary_distances(
                     }
                 }
 
+                // Combine accumulators
                 __m256 combined1 = _mm256_add_ps(acc[0], acc[1]);
                 __m256 combined2 = _mm256_add_ps(acc[2], acc[3]);
                 __m256 final_combined = _mm256_add_ps(combined1, combined2);
@@ -1835,6 +2027,7 @@ void IndexJHQ::compute_primary_distances(
                     total_distance += distance_table_flat[m * K0 + code_val];
                 }
             } else if (M >= 16) {
+                // Original AVX2 16-wide processing
                 __m256 acc1 = _mm256_setzero_ps();
                 __m256 acc2 = _mm256_setzero_ps();
                 int m = 0;
@@ -1880,6 +2073,7 @@ void IndexJHQ::compute_primary_distances(
             } else
 #endif
             {
+                // Enhanced scalar version
                 int m = 0;
                 for (; m + 7 < M; m += 8) {
                     float sum =
@@ -2026,6 +2220,9 @@ void IndexJHQ::reset()
     codewords.clear();
     scalar_codebooks.clear();
 
+    residual_pq_.reset();
+    residual_pq_dirty_ = true;
+
     codes.resize(0);
     separated_codes_.clear();
     ntotal = 0;
@@ -2039,6 +2236,7 @@ void IndexJHQ::reset_data()
     codes.clear();
     separated_codes_.clear();
     ntotal = 0;
+    residual_pq_dirty_ = true;
 }
 
 void IndexJHQ::analytical_gaussian_init(
@@ -2390,6 +2588,9 @@ void IndexJHQ::set_clustering_parameters(bool use_kmeans, int niter, int seed)
     kmeans_niter = niter;
     kmeans_seed = seed;
 
+    if (verbose) {
+        std::cout << "JHQ clustering mode: " << (use_kmeans ? "Analytical + K-means" : "Analytical only") << std::endl;
+    }
 }
 
 IndexJHQ::SearchWorkspace& IndexJHQ::get_search_workspace() const
@@ -2582,6 +2783,9 @@ float JHQDistanceComputer::precomputed_distance_to_code(const uint8_t* code) con
 {
     const size_t vector_idx = (code - codes) / code_size;
     const uint8_t* primary_codes_ptr = index.separated_codes_.get_primary_codes(vector_idx);
+    const uint8_t* residual_codes_ptr = has_residual_levels
+        ? index.separated_codes_.get_residual_codes(vector_idx)
+        : nullptr;
 
     float total_distance = 0.0f;
 
@@ -2617,6 +2821,14 @@ float JHQDistanceComputer::precomputed_distance_to_code(const uint8_t* code) con
 
     if (has_residual_levels) {
         total_distance += compute_precomputed_residual_distance(vector_idx);
+        if (residual_codes_ptr) {
+            total_distance += jhq_internal::compute_cross_term_from_codes(
+                index,
+                primary_codes_ptr,
+                residual_codes_ptr,
+                index.separated_codes_.residual_subspace_stride,
+                index.separated_codes_.residual_level_stride);
+        }
     }
 
     return total_distance;
@@ -2626,20 +2838,74 @@ float JHQDistanceComputer::distance_to_code_with_decoding(const uint8_t* code) c
 {
     BitstringReader bit_reader(code, index.code_size);
     float total_distance = 0.0f;
+    float cross_term = 0.0f;
 
-    if (temp_workspace.size() < M) {
-        temp_workspace.resize(M);
+    float* residual_buffer = nullptr;
+    if (has_residual_levels) {
+        if (temp_workspace.size() < static_cast<size_t>(Ds)) {
+            temp_workspace.resize(Ds);
+        }
+        residual_buffer = temp_workspace.data();
     }
 
-    for (int m = 0; m < M; ++m) {
-        const uint32_t centroid_id = bit_reader.read(index.level_bits[0]);
-        temp_workspace[m] = use_quantized_tables ? quantization_offset + quantized_primary_tables[m * K0 + centroid_id] * quantization_scale : primary_distance_table_flat[m * K0 + centroid_id];
+    const uint32_t primary_limit = static_cast<uint32_t>((1 << index.level_bits[0]) - 1);
 
-        bit_reader.i += index.residual_bits_per_subspace;
+    for (int m = 0; m < M; ++m) {
+        uint32_t centroid_id = bit_reader.read(index.level_bits[0]);
+        centroid_id = std::min(centroid_id, primary_limit);
+        const size_t table_idx = static_cast<size_t>(m) * K0 + centroid_id;
+        const float primary_contrib = use_quantized_tables
+            ? quantization_offset + quantized_primary_tables[table_idx] * quantization_scale
+            : primary_distance_table_flat[table_idx];
+        total_distance += primary_contrib;
+
+        if (has_residual_levels) {
+            std::fill(residual_buffer, residual_buffer + Ds, 0.0f);
+
+            const auto& centroids = index.codewords[m][0];
+            const int num_centroids = centroids.empty() ? 0 : static_cast<int>(centroids.size() / Ds);
+            const uint32_t safe_centroid = centroids.empty()
+                ? 0
+                : std::min<uint32_t>(centroid_id, static_cast<uint32_t>(std::max(0, num_centroids - 1)));
+            const float* centroid_ptr = centroids.empty()
+                ? nullptr
+                : centroids.data() + static_cast<size_t>(safe_centroid) * Ds;
+
+            for (int level = 1; level < num_levels; ++level) {
+                const size_t level_offset = residual_table_offsets[level];
+                const int K_res = 1 << index.level_bits[level];
+                const uint32_t residual_limit = static_cast<uint32_t>(K_res - 1);
+                const size_t table_base = level_offset + static_cast<size_t>(m) * Ds * K_res;
+                const auto& scalar_codebook = index.scalar_codebooks[m][level - 1];
+                const int codebook_size = static_cast<int>(scalar_codebook.size());
+
+                for (int d = 0; d < Ds; ++d) {
+                    uint32_t scalar_id = bit_reader.read(index.level_bits[level]);
+                    scalar_id = std::min(scalar_id, residual_limit);
+                    const size_t lut_idx = table_base + static_cast<size_t>(d) * K_res + scalar_id;
+                    total_distance += residual_distance_tables_flat[lut_idx];
+
+                    if (codebook_size > 0) {
+                        const uint32_t safe_scalar = std::min<uint32_t>(
+                            scalar_id,
+                            static_cast<uint32_t>(codebook_size - 1));
+                        residual_buffer[d] += scalar_codebook[safe_scalar];
+                    }
+                }
+            }
+
+            if (centroid_ptr) {
+                for (int d = 0; d < Ds; ++d) {
+                    cross_term += centroid_ptr[d] * residual_buffer[d];
+                }
+            }
+        } else {
+            bit_reader.i += index.residual_bits_per_subspace;
+        }
     }
 
-    for (int m = 0; m < M; ++m) {
-        total_distance += temp_workspace[m];
+    if (has_residual_levels) {
+        total_distance += 2.0f * cross_term;
     }
 
     return total_distance;
@@ -2921,6 +3187,15 @@ IndexJHQ* read_index_jhq(IOReader* f)
                           << ", Got: " << idx->codes.size() << std::endl;
             }
         }
+
+        if (idx->verbose) {
+            std::cout << "Completed comprehensive IndexJHQ state restoration:" << std::endl;
+            std::cout << "  - Vectors: " << idx->ntotal << std::endl;
+            std::cout << "  - Code size: " << idx->code_size << " bytes" << std::endl;
+            std::cout << "  - Residual bits per subspace: " << idx->residual_bits_per_subspace << std::endl;
+            std::cout << "  - Memory layout: " << (idx->memory_layout_initialized_ ? "optimized" : "standard") << std::endl;
+            std::cout << "  - JL transform: " << (idx->is_rotation_trained ? "ready" : "disabled") << std::endl;
+        }
     }
 
     return idx;
@@ -2933,6 +3208,9 @@ void IndexJHQ::encode_to_separated_storage(idx_t n, const float* x_rotated) cons
     const_cast<jhq_internal::PreDecodedCodes&>(separated_codes_).initialize(M, Ds, num_levels, old_total + n);
 
     if (old_total > 0 && codes.size() > 0) {
+        if (verbose) {
+            std::cout << "Migrating " << old_total << " existing vectors to separated storage..." << std::endl;
+        }
 
 #pragma omp parallel for schedule(static) if (old_total > 1000)
         for (idx_t i = 0; i < old_total; ++i) {
@@ -2965,10 +3243,10 @@ void IndexJHQ::encode_single_vector_separated(const float* x, idx_t vector_idx) 
 
         const auto& centroids = codewords[m][0];
         int K = static_cast<int>(centroids.size() / Ds);
-        int best_k = find_best_centroid_fast(current_residual.data(), centroids, K);
+        int best_k = find_best_centroid(current_residual.data(), centroids, K);
         primary_dest[m] = static_cast<uint8_t>(best_k);
 
-        subtract_centroid_fast(current_residual.data(), centroids, best_k);
+        subtract_centroid(current_residual.data(), centroids, best_k);
 
         if (residual_dest && num_levels > 1) {
             encode_residual_levels_separated(m, current_residual.data(), residual_dest, residual_offset);
@@ -2976,7 +3254,7 @@ void IndexJHQ::encode_single_vector_separated(const float* x, idx_t vector_idx) 
     }
 }
 
-int IndexJHQ::find_best_centroid_fast(const float* residual, const std::vector<float>& centroids, int K) const
+int IndexJHQ::find_best_centroid(const float* residual, const std::vector<float>& centroids, int K) const
 {
     int best_k = 0;
     float best_dist = std::numeric_limits<float>::max();
@@ -3047,7 +3325,7 @@ int IndexJHQ::find_best_centroid_fast(const float* residual, const std::vector<f
     return best_k;
 }
 
-void IndexJHQ::subtract_centroid_fast(float* residual, const std::vector<float>& centroids, int best_k) const
+void IndexJHQ::subtract_centroid(float* residual, const std::vector<float>& centroids, int best_k) const
 {
     const float* best_centroid = centroids.data() + best_k * Ds;
 

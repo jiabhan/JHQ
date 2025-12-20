@@ -1,6 +1,7 @@
 #pragma once
 
 #include <faiss/IndexIVF.h>
+#include <faiss/IndexIVFPQ.h>
 #include <faiss/impl/io.h>
 #include <faiss/impl/platform_macros.h>
 #include <faiss/index_io.h>
@@ -14,6 +15,8 @@
 #include <vector>
 
 namespace faiss {
+
+struct IndexIVFPQ;
 
 struct IVFJHQSearchParameters : IVFSearchParameters {
     float jhq_oversampling_factor = -1.0f;
@@ -34,6 +37,7 @@ struct BatchCandidate {
 struct IndexIVFJHQ : IndexIVF {
 
     IndexJHQ jhq;
+    mutable std::unique_ptr<IndexIVFPQ> single_level_adapter_;
 
     float default_jhq_oversampling = 4.0f;
     bool use_early_termination = true;
@@ -51,6 +55,7 @@ struct IndexIVFJHQ : IndexIVF {
 
     mutable std::vector<jhq_internal::PreDecodedCodes> list_pre_decoded_codes;
     mutable bool pre_decoded_codes_initialized = false;
+    mutable bool single_level_adapter_dirty_ = true;
 
     bool use_pre_decoded_codes = true;
     size_t pre_decode_threshold = 1000;
@@ -58,6 +63,41 @@ struct IndexIVFJHQ : IndexIVF {
     static constexpr size_t HEAP_BATCH_SIZE = 64;
 
     mutable std::vector<BatchCandidate> heap_batch_buffer;
+
+    struct SearchWorkspace {
+        std::vector<idx_t> list_indices;
+        std::vector<float> coarse_distances;
+        std::vector<float> rotated_queries;
+
+        void ensure_capacity(idx_t nq, size_t nprobe, size_t dim)
+        {
+            const size_t total_lists = static_cast<size_t>(nq) * nprobe;
+            const size_t rotated_size = static_cast<size_t>(nq) * dim;
+
+            if (list_indices.capacity() < total_lists) {
+                list_indices.reserve(total_lists);
+            }
+            if (coarse_distances.capacity() < total_lists) {
+                coarse_distances.reserve(total_lists);
+            }
+            if (rotated_queries.capacity() < rotated_size) {
+                rotated_queries.reserve(rotated_size);
+            }
+
+            list_indices.resize(total_lists);
+            coarse_distances.resize(total_lists);
+            rotated_queries.resize(rotated_size);
+        }
+    };
+
+    SearchWorkspace& get_search_workspace() const;
+    static thread_local SearchWorkspace search_workspace_;
+    void ensure_single_level_adapter_ready() const;
+    void mark_single_level_adapter_dirty();
+    bool should_use_single_level_adapter() const
+    {
+        return jhq.num_levels == 1;
+    }
 
     IndexIVFJHQ();
 
@@ -255,7 +295,7 @@ struct IndexIVFJHQ : IndexIVF {
 protected:
     void initialize_optimized_layout();
 
-    void process_range_query_optimized(
+    void process_range_query(
         idx_t query_idx,
         const float* x,
         float radius,
@@ -313,6 +353,9 @@ struct IVFJHQScanner : InvertedListScanner {
     mutable AlignedTable<float> workspace_primary_distances;
     mutable std::vector<size_t> workspace_candidate_indices;
     mutable std::vector<float> workspace_candidate_distances;
+    mutable std::vector<uint16_t> workspace_primary_distances_quantized;
+    mutable float primary_distance_min = 0.0f;
+    mutable float primary_distance_scale = 1.0f;
 
     mutable size_t workspace_capacity_lists;
     mutable size_t workspace_capacity_primary_tables;
@@ -430,6 +473,13 @@ private:
         float* simi,
         idx_t* idxi,
         size_t k) const;
+    size_t scan_codes_exhaustive_l2_gated(
+        size_t list_size,
+        const uint8_t* codes,
+        const idx_t* ids,
+        float* simi,
+        idx_t* idxi,
+        size_t k) const;
     size_t scan_codes_small_k_simd(size_t list_size, const uint8_t* codes, const idx_t* ids, float* simi, idx_t* idxi, size_t k) const;
     size_t scan_codes_k4_unrolled(size_t list_size, const uint8_t* codes, const idx_t* ids, float* simi, idx_t* idxi, size_t k) const;
     size_t scan_codes_k8_unrolled(size_t list_size, const uint8_t* codes, const idx_t* ids, float* simi, idx_t* idxi, size_t k) const;
@@ -450,6 +500,8 @@ private:
     void resize_workspace(size_t required_size, std::vector<float>& workspace, size_t& current_capacity) const;
     void resize_workspace(size_t required_size, std::vector<size_t>& workspace, size_t& current_capacity) const;
     void resize_workspace(size_t required_size, AlignedTable<float>& workspace, size_t& current_capacity) const;
+    void quantize_primary_distances(size_t list_size) const;
+    float reconstruct_primary_distance(uint16_t qvalue) const;
 
     float distance_to_code_pre_decoded(const uint8_t* code) const;
     float compute_residual_distance_pre_decoded(size_t vector_idx_in_list) const;
@@ -497,6 +549,9 @@ private:
 
     mutable std::vector<idx_t> workspace_candidate_indices_faiss;
     mutable std::vector<float> workspace_candidate_distances_faiss;
+
+    idx_t get_candidate_id(size_t j, const idx_t* ids) const;
+    bool passes_selector(size_t j, const idx_t* ids) const;
 };
 
 struct IndexIVFJHQStats {

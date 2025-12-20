@@ -8,6 +8,7 @@
 #include <faiss/impl/FaissAssert.h>
 #include <faiss/impl/index_read_utils.h>
 #include <faiss/impl/io_macros.h>
+#include <faiss/invlists/DirectMap.h>
 #include <faiss/utils/Heap.h>
 #include <faiss/utils/distances.h>
 #include <faiss/utils/utils.h>
@@ -19,8 +20,80 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <limits>
 
 namespace faiss {
+
+thread_local IndexIVFJHQ::SearchWorkspace IndexIVFJHQ::search_workspace_;
+
+IndexIVFJHQ::SearchWorkspace& IndexIVFJHQ::get_search_workspace() const
+{
+    return search_workspace_;
+}
+
+void IndexIVFJHQ::mark_single_level_adapter_dirty()
+{
+    single_level_adapter_dirty_ = true;
+}
+
+void IndexIVFJHQ::ensure_single_level_adapter_ready() const
+{
+    if (!should_use_single_level_adapter()) {
+        return;
+    }
+
+    if (!single_level_adapter_) {
+        single_level_adapter_ = std::make_unique<IndexIVFPQ>(
+            quantizer,
+            d,
+            nlist,
+            jhq.M,
+            jhq.level_bits[0],
+            metric_type,
+            false);
+        single_level_adapter_->own_invlists = false;
+        single_level_adapter_->by_residual = false;
+        single_level_adapter_->use_precomputed_table = 0;
+        single_level_adapter_->scan_table_threshold = 0;
+        single_level_adapter_dirty_ = true;
+    }
+
+    if (single_level_adapter_dirty_) {
+        auto& adapter = *single_level_adapter_;
+        adapter.quantizer = quantizer;
+        adapter.nlist = nlist;
+        adapter.invlists = invlists;
+        adapter.ntotal = ntotal;
+        adapter.metric_type = metric_type;
+        adapter.by_residual = false;
+        adapter.use_precomputed_table = 0;
+        adapter.scan_table_threshold = 0;
+        adapter.parallel_mode = parallel_mode;
+
+        adapter.pq = ProductQuantizer(d, jhq.M, jhq.level_bits[0]);
+        adapter.pq.set_derived_values();
+        for (int m = 0; m < jhq.M; ++m) {
+            const auto& centroids = jhq.codewords[m][0];
+            FAISS_THROW_IF_NOT_MSG(
+                centroids.size() == adapter.pq.ksub * adapter.pq.dsub,
+                "Primary codebook size mismatch for single-level adapter");
+            std::memcpy(
+                adapter.pq.get_centroids(m, 0),
+                centroids.data(),
+                centroids.size() * sizeof(float));
+        }
+
+        adapter.code_size = adapter.pq.code_size;
+        adapter.is_trained = is_trained;
+        adapter.ntotal = ntotal;
+        single_level_adapter_dirty_ = false;
+    } else {
+        single_level_adapter_->invlists = invlists;
+        single_level_adapter_->ntotal = ntotal;
+        single_level_adapter_->metric_type = metric_type;
+        single_level_adapter_->parallel_mode = parallel_mode;
+    }
+}
 
 class JHQDecoder {
 public:
@@ -331,6 +404,13 @@ IndexIVFJHQ::IndexIVFJHQ(Index* quantizer,
     , default_jhq_oversampling(jhq_oversampling)
     , use_early_termination(true)
 {
+    if (verbose) {
+        printf("Initializing IndexIVFJHQ: d=%zd, nlist=%zd, M=%zd, levels=%zd\n",
+            d,
+            nlist,
+            M,
+            level_bits.size());
+    }
 
     validate_parameters();
     code_size = jhq.code_size;
@@ -341,6 +421,13 @@ IndexIVFJHQ::IndexIVFJHQ(Index* quantizer,
 
     is_trained = false;
 
+    if (verbose) {
+        printf("IndexIVFJHQ initialized: code_size=%zd bytes\n", code_size);
+        printf("JHQ configuration: M=%d, Ds=%d, levels=%d\n",
+            jhq.M,
+            jhq.Ds,
+            jhq.num_levels);
+    }
 }
 
 IndexIVFJHQ::IndexIVFJHQ()
@@ -376,6 +463,14 @@ void IndexIVFJHQ::validate_parameters() const
 
 void IndexIVFJHQ::train(idx_t n, const float* x)
 {
+    if (verbose) {
+        printf("\n=== Training IndexIVFJHQ (Optimized) ===\n");
+        printf("Training vectors: %zd\n", n);
+        printf("Dimension: %d\n", d);
+        printf("Coarse clusters: %zd\n", nlist);
+        printf("JHQ subspaces: %d\n", jhq.M);
+    }
+
     FAISS_THROW_IF_NOT_MSG(n > 0, "Training set cannot be empty");
     FAISS_THROW_IF_NOT_MSG(x != nullptr, "Training data cannot be null");
     FAISS_THROW_IF_NOT_MSG(
@@ -391,34 +486,69 @@ void IndexIVFJHQ::train(idx_t n, const float* x)
     train_q1(n, x, verbose, metric_type);
     double coarse_time = getmillisecs() - coarse_start_time;
 
-    double start_time = getmillisecs();
+    if (verbose) {
+        printf("Stage 2: Training JHQ on original vectors...\n");
+    }
+    double jhq_start_time = getmillisecs();
     train_jhq_on_originals(n, x);
-    double jhq_time = getmillisecs() - start_time;
+    double jhq_time = getmillisecs() - jhq_start_time;
 
     is_trained = true;
 
     initialize_optimized_layout();
+    mark_single_level_adapter_dirty();
 
     double total_time = getmillisecs() - training_start_time;
+
+    if (verbose) {
+        printf("=== Training Complete ===\n");
+        printf("Total training time: %.2f ms\n", total_time);
+        printf("  - Coarse quantizer: %.1f%%\n",
+            100.0 * coarse_time / total_time);
+        printf("  - JHQ training: %.1f%%\n", 100.0 * jhq_time / total_time);
+        printf("Memory usage: %.2f MB\n",
+            get_memory_usage() / (1024.0 * 1024.0));
+    }
 }
 
 void IndexIVFJHQ::train_jhq_on_originals(idx_t n, const float* x)
 {
+    if (verbose) {
+        printf("Training JHQ on %zd original vectors...\n", n);
+    }
+
     jhq.train(n, x);
 
     FAISS_THROW_IF_NOT_MSG(jhq.is_trained_(), "JHQ training failed");
     is_trained = true;
 
+    if (verbose) {
+        printf("JHQ training successful:\n");
+        printf("  - Code size: %zd bytes per vector\n", jhq.code_size);
+        printf("  - Compression ratio: %.1fx\n",
+            (sizeof(float) * d) / (float)jhq.code_size);
+        printf("  - JL transform: %s\n",
+            jhq.use_jl_transform ? "enabled" : "disabled");
+        printf("  - Levels: %d\n", jhq.num_levels);
+    }
+    mark_single_level_adapter_dirty();
 }
 
 void IndexIVFJHQ::train_jhq_with_precomputed_residuals(
     idx_t n,
     const float* residuals)
 {
+    if (verbose) {
+        printf("Training JHQ with precomputed residuals (%zd vectors)...\n", n);
+    }
 
-    double start_time = getmillisecs();
+    double jhq_start_time = getmillisecs();
     train_jhq_on_originals(n, residuals);
-    double jhq_time = getmillisecs() - start_time;
+    double jhq_time = getmillisecs() - jhq_start_time;
+
+    if (verbose) {
+        printf("JHQ trained on residuals in %.2f ms\n", jhq_time);
+    }
 
     initialize_optimized_layout();
     is_trained = true;
@@ -435,11 +565,20 @@ void IndexIVFJHQ::add_with_precomputed_assignments(
     const idx_t* xids,
     const idx_t* coarse_idx)
 {
+    if (verbose) {
+        printf("Adding %zd vectors with precomputed assignments...\n", n);
+    }
 
     double start_time = getmillisecs();
     add_core(n, x, xids, coarse_idx);
     double add_time = getmillisecs() - start_time;
+    mark_single_level_adapter_dirty();
 
+    if (verbose) {
+        printf("Added vectors in %.2f ms (%.2f vectors/ms)\n",
+            add_time,
+            n / add_time);
+    }
 }
 
 void IndexIVFJHQ::add_core(idx_t n,
@@ -459,6 +598,11 @@ void IndexIVFJHQ::add_core(idx_t n,
     if (n > batch_size) {
         for (idx_t i0 = 0; i0 < n; i0 += batch_size) {
             idx_t i1 = std::min(n, i0 + batch_size);
+            if (verbose) {
+                printf("IndexIVFJHQ::add_core: processing batch %" PRId64
+                       ":%" PRId64 " / %" PRId64 "\n",
+                    i0, i1, n);
+            }
             add_core(i1 - i0,
                 x + i0 * d,
                 xids ? xids + i0 : nullptr,
@@ -512,12 +656,23 @@ void IndexIVFJHQ::add_core(idx_t n,
 
     ntotal += n;
 
+    if (verbose && (n_ignored > 0 || n > 1000)) {
+        printf("IndexIVFJHQ::add_core: added %zd vectors, ignored %zd\n",
+            n_added, n_ignored);
+        printf("  - Separated storage encoding: %.2f ms\n", encode_time);
+        printf("  - Inverted list updates: %.2f ms\n", add_time);
+        printf("  - Using separated storage: %s\n",
+            jhq.has_pre_decoded_codes() ? "YES" : "NO");
+    }
+
     if (pre_decoded_codes_initialized) {
         invalidate_pre_decoded_codes();
         if (use_pre_decoded_codes && ntotal > pre_decode_threshold * nlist / 4) {
             initialize_pre_decoded_codes();
         }
     }
+
+    mark_single_level_adapter_dirty();
 }
 
 void IndexIVFJHQ::search(idx_t n,
@@ -538,33 +693,44 @@ void IndexIVFJHQ::search(idx_t n,
         search_nprobe = jhq_params->nprobe;
     }
 
+    if (should_use_single_level_adapter()) {
+        ensure_single_level_adapter_ready();
+    }
+
     const size_t actual_nprobe = std::min(nlist, search_nprobe);
     FAISS_THROW_IF_NOT_MSG(actual_nprobe > 0, "nprobe must be positive");
 
+    auto& workspace = get_search_workspace();
+    workspace.ensure_capacity(n, actual_nprobe, d);
+
+    idx_t* idx_buffer = workspace.list_indices.data();
+    float* coarse_dis_buffer = workspace.coarse_distances.data();
+    float* rotated_queries = workspace.rotated_queries.data();
+    const size_t total_lists = static_cast<size_t>(n) * actual_nprobe;
+
     double t0 = getmillisecs();
 
-    std::vector<idx_t> idx(n * actual_nprobe);
-    std::vector<float> coarse_dis(n * actual_nprobe);
-
-    quantizer->search(n, x, actual_nprobe, coarse_dis.data(), idx.data());
+    quantizer->search(n, x, actual_nprobe, coarse_dis_buffer, idx_buffer);
 
     double t1 = getmillisecs();
 
-    std::vector<float> x_rotated(n * d);
     if (jhq.use_jl_transform && jhq.is_rotation_trained) {
-        jhq.apply_jl_rotation(n, x, x_rotated.data());
+        if (verbose) {
+            printf("Batch rotating %zd queries for JHQ search...\n", n);
+        }
+        jhq.apply_jl_rotation(n, x, rotated_queries);
     } else {
-        std::memcpy(x_rotated.data(), x, sizeof(float) * n * d);
+        std::memcpy(rotated_queries, x, sizeof(float) * n * d);
     }
 
-    invlists->prefetch_lists(idx.data(), n * actual_nprobe);
+    invlists->prefetch_lists(idx_buffer, total_lists);
 
     const IVFSearchParameters* ivf_params = dynamic_cast<const IVFSearchParameters*>(params);
     search_preassigned_with_rotated_queries(n,
-        x_rotated.data(),
+        rotated_queries,
         k,
-        idx.data(),
-        coarse_dis.data(),
+        idx_buffer,
+        coarse_dis_buffer,
         distances,
         labels,
         false,
@@ -595,48 +761,69 @@ void IndexIVFJHQ::search_preassigned(idx_t n,
 
     size_t total_ndis = 0;
 
-#pragma omp parallel for reduction(+ : total_ndis) if (n > 1)
-    for (idx_t i = 0; i < n; ++i) {
+    std::vector<float> rotated_queries_single_level;
+    const bool adapter_active = should_use_single_level_adapter();
+    const bool need_pre_rotated_queries = adapter_active && jhq.use_jl_transform && jhq.is_rotation_trained;
+    if (need_pre_rotated_queries) {
+        rotated_queries_single_level.resize(static_cast<size_t>(n) * d);
+        jhq.apply_jl_rotation(n, x, rotated_queries_single_level.data());
+    }
+    const float* adapter_query_data = need_pre_rotated_queries ? rotated_queries_single_level.data() : x;
+
+#pragma omp parallel if (n > 1) reduction(+ : total_ndis)
+    {
         std::unique_ptr<InvertedListScanner> scanner(
             get_InvertedListScanner(store_pairs, nullptr, params));
+        auto* jhq_scanner = dynamic_cast<IVFJHQScanner*>(scanner.get());
 
-        float* simi = distances + i * k;
-        idx_t* idxi = labels + i * k;
+#pragma omp for schedule(static)
+        for (idx_t i = 0; i < n; ++i) {
+            float* simi = distances + i * k;
+            idx_t* idxi = labels + i * k;
 
-        if (is_max_heap) {
-            heap_heapify<CMin<float, idx_t>>(k, simi, idxi);
-        } else {
-            heap_heapify<CMax<float, idx_t>>(k, simi, idxi);
+            if (is_max_heap) {
+                heap_heapify<CMin<float, idx_t>>(k, simi, idxi);
+            } else {
+                heap_heapify<CMax<float, idx_t>>(k, simi, idxi);
+            }
+
+            if (jhq_scanner) {
+                jhq_scanner->reset_for_reuse();
+                jhq_scanner->set_query(x + i * d);
+            } else {
+                scanner->set_query(adapter_query_data + i * d);
+            }
+
+            size_t ndis_query = 0;
+
+            for (size_t ik = 0; ik < nprobe; ik++) {
+                idx_t key = keys[i * nprobe + ik];
+                if (key < 0) {
+                    continue;
+                }
+
+                scanner->set_list(key, coarse_dis[i * nprobe + ik]);
+                size_t list_size = invlists->list_size(key);
+                if (list_size == 0) {
+                    continue;
+                }
+
+                InvertedLists::ScopedCodes codes(invlists, key);
+                InvertedLists::ScopedIds ids(invlists, key);
+
+                scanner->scan_codes(
+                    list_size, codes.get(), ids.get(), simi, idxi, k);
+                ndis_query += list_size;
+            }
+
+            if (is_max_heap) {
+                heap_reorder<CMin<float, idx_t>>(k, simi, idxi);
+            } else {
+                heap_reorder<CMax<float, idx_t>>(k, simi, idxi);
+            }
+
+            total_ndis += ndis_query;
         }
-
-        scanner->set_query(x + i * d);
-        size_t ndis_query = 0;
-
-        for (size_t ik = 0; ik < nprobe; ik++) {
-            idx_t key = keys[i * nprobe + ik];
-            if (key < 0)
-                continue;
-
-            scanner->set_list(key, coarse_dis[i * nprobe + ik]);
-            size_t list_size = invlists->list_size(key);
-            if (list_size == 0)
-                continue;
-
-            InvertedLists::ScopedCodes codes(invlists, key);
-            InvertedLists::ScopedIds ids(invlists, key);
-
-            size_t nup = scanner->scan_codes(
-                list_size, codes.get(), ids.get(), simi, idxi, k);
-            ndis_query += list_size;
-        }
-
-        if (is_max_heap) {
-            heap_reorder<CMin<float, idx_t>>(k, simi, idxi);
-        } else {
-            heap_reorder<CMax<float, idx_t>>(k, simi, idxi);
-        }
-
-        total_ndis += ndis_query;
     }
 
     if (ivf_stats) {
@@ -664,54 +851,60 @@ void IndexIVFJHQ::search_preassigned_with_rotated_queries(
 
     size_t total_ndis = 0;
 
-#pragma omp parallel for reduction(+ : total_ndis) if (n > 1)
-    for (idx_t i = 0; i < n; ++i) {
+#pragma omp parallel if (n > 1) reduction(+ : total_ndis)
+    {
         std::unique_ptr<InvertedListScanner> scanner(
             get_InvertedListScanner(store_pairs, nullptr, params));
-
-        float* simi = distances + i * k;
-        idx_t* idxi = labels + i * k;
-
-        if (is_max_heap) {
-            heap_heapify<CMin<float, idx_t>>(k, simi, idxi);
-        } else {
-            heap_heapify<CMax<float, idx_t>>(k, simi, idxi);
-        }
-
         auto* jhq_scanner = dynamic_cast<IVFJHQScanner*>(scanner.get());
-        if (jhq_scanner) {
-            jhq_scanner->set_rotated_query(x_rotated + i * d);
-        } else {
-            scanner->set_query(x_rotated + i * d);
+
+#pragma omp for schedule(static)
+        for (idx_t i = 0; i < n; ++i) {
+            float* simi = distances + i * k;
+            idx_t* idxi = labels + i * k;
+
+            if (is_max_heap) {
+                heap_heapify<CMin<float, idx_t>>(k, simi, idxi);
+            } else {
+                heap_heapify<CMax<float, idx_t>>(k, simi, idxi);
+            }
+
+            if (jhq_scanner) {
+                jhq_scanner->reset_for_reuse();
+                jhq_scanner->set_rotated_query(x_rotated + i * d);
+            } else {
+                scanner->set_query(x_rotated + i * d);
+            }
+
+            size_t ndis_query = 0;
+
+            for (size_t ik = 0; ik < nprobe; ik++) {
+                idx_t key = keys[i * nprobe + ik];
+                if (key < 0) {
+                    continue;
+                }
+
+                scanner->set_list(key, coarse_dis[i * nprobe + ik]);
+                size_t list_size = invlists->list_size(key);
+                if (list_size == 0) {
+                    continue;
+                }
+
+                InvertedLists::ScopedCodes codes(invlists, key);
+                InvertedLists::ScopedIds ids(invlists, key);
+
+                scanner->scan_codes(
+                    list_size, codes.get(), ids.get(), simi, idxi, k);
+                ndis_query += list_size;
+            }
+
+            if (is_max_heap) {
+                heap_reorder<CMin<float, idx_t>>(k, simi, idxi);
+            } else {
+                heap_reorder<CMax<float, idx_t>>(k, simi, idxi);
+            }
+
+            total_ndis += ndis_query;
         }
-
-        size_t ndis_query = 0;
-
-        for (size_t ik = 0; ik < nprobe; ik++) {
-            idx_t key = keys[i * nprobe + ik];
-            if (key < 0)
-                continue;
-
-            scanner->set_list(key, coarse_dis[i * nprobe + ik]);
-            size_t list_size = invlists->list_size(key);
-            if (list_size == 0)
-                continue;
-
-            InvertedLists::ScopedCodes codes(invlists, key);
-            InvertedLists::ScopedIds ids(invlists, key);
-
-            size_t nup = scanner->scan_codes(
-                list_size, codes.get(), ids.get(), simi, idxi, k);
-            ndis_query += list_size;
-        }
-
-        if (is_max_heap) {
-            heap_reorder<CMin<float, idx_t>>(k, simi, idxi);
-        } else {
-            heap_reorder<CMax<float, idx_t>>(k, simi, idxi);
-        }
-
-        total_ndis += ndis_query;
     }
 
     if (ivf_stats) {
@@ -761,7 +954,7 @@ void IndexIVFJHQ::range_search_preassigned(idx_t nx,
     if (use_parallel) {
 #pragma omp parallel for reduction(+ : total_ndis)
         for (idx_t i = 0; i < nx; ++i) {
-            process_range_query_optimized(i,
+            process_range_query(i,
                 x,
                 radius,
                 keys,
@@ -774,7 +967,7 @@ void IndexIVFJHQ::range_search_preassigned(idx_t nx,
         }
     } else {
         for (idx_t i = 0; i < nx; ++i) {
-            process_range_query_optimized(i,
+            process_range_query(i,
                 x,
                 radius,
                 keys,
@@ -818,7 +1011,7 @@ void IndexIVFJHQ::range_search_preassigned(idx_t nx,
     }
 }
 
-void IndexIVFJHQ::process_range_query_optimized(
+void IndexIVFJHQ::process_range_query(
     idx_t query_idx,
     const float* x,
     float radius,
@@ -892,6 +1085,9 @@ void IndexIVFJHQ::encode_vectors(idx_t n,
         x != nullptr && list_nos != nullptr && codes != nullptr,
         "Input pointers cannot be null");
 
+    if (verbose && n > 10000) {
+        printf("Encoding %zd vectors with optimized IVFJHQ...\n", n);
+    }
 
     if (include_listno) {
         size_t coarse_size = coarse_code_size();
@@ -972,7 +1168,12 @@ void IndexIVFJHQ::reset()
     rotated_coarse_centroids.clear();
     rotated_centroids_computed = false;
     is_trained = false;
+    single_level_adapter_.reset();
+    single_level_adapter_dirty_ = true;
 
+    if (verbose) {
+        printf("IndexIVFJHQ reset completed\n");
+    }
 }
 
 void IndexIVFJHQ::merge_from(Index& otherIndex, idx_t add_id)
@@ -980,6 +1181,13 @@ void IndexIVFJHQ::merge_from(Index& otherIndex, idx_t add_id)
     check_compatible_for_merge(otherIndex);
 
     IndexIVFJHQ* other = static_cast<IndexIVFJHQ*>(&otherIndex);
+
+    if (verbose) {
+        printf("Merging IndexIVFJHQ: this.ntotal=%" PRId64
+               ", other.ntotal=%" PRId64 "\n",
+            ntotal,
+            other->ntotal);
+    }
 
     invlists->merge_from(other->invlists, add_id);
 
@@ -991,7 +1199,11 @@ void IndexIVFJHQ::merge_from(Index& otherIndex, idx_t add_id)
     }
 
     invalidate_pre_decoded_codes();
+    mark_single_level_adapter_dirty();
 
+    if (verbose) {
+        printf("IndexIVFJHQ merge completed: ntotal = %" PRId64 "\n", ntotal);
+    }
 }
 
 void IndexIVFJHQ::check_compatible_for_merge(
@@ -1031,12 +1243,18 @@ void IndexIVFJHQ::set_jhq_oversampling(float oversampling)
     default_jhq_oversampling = oversampling;
     jhq.set_default_oversampling(oversampling);
 
+    if (verbose) {
+        printf("Updated JHQ oversampling to %.2f\n", oversampling);
+    }
 }
 
 void IndexIVFJHQ::set_early_termination(bool enable)
 {
     use_early_termination = enable;
 
+    if (verbose) {
+        printf("Early termination %s\n", enable ? "enabled" : "disabled");
+    }
 }
 
 void IndexIVFJHQ::set_pre_decode_threshold(size_t threshold)
@@ -1169,9 +1387,16 @@ void IndexIVFJHQ::optimize_for_search()
         return;
     }
 
+    if (verbose) {
+        printf("Optimizing IndexIVFJHQ for search performance...\n");
+    }
+
     double opt_start = getmillisecs();
 
     if (!jhq.is_trained_()) {
+        if (verbose) {
+            printf("WARNING: JHQ not marked as trained, fixing...\n");
+        }
         jhq.is_trained = true;
     }
 
@@ -1202,7 +1427,12 @@ void IndexIVFJHQ::optimize_for_search()
 
     double opt_time = getmillisecs() - opt_start;
 
-    if (use_pre_decoded_codes && ntotal > 0) {
+    if (should_use_single_level_adapter()) {
+        if (use_pre_decoded_codes) {
+            enable_pre_decoded_codes(false);
+        }
+        ensure_single_level_adapter_ready();
+    } else if (use_pre_decoded_codes && ntotal > 0) {
         if (verbose) {
             printf("Initializing pre-decoded codes for search optimization...\n");
         }
@@ -1217,6 +1447,21 @@ void IndexIVFJHQ::optimize_for_search()
             }
             printf("Pre-decoded codes initialized for %zu/%zu lists\n", optimized_lists, nlist);
         }
+    }
+
+    if (verbose) {
+        printf("Search optimization completed in %.2f ms\n", opt_time);
+        printf("Final configuration:\n");
+        printf("  - JHQ trained: %s\n", jhq.is_trained_() ? "YES" : "NO");
+        printf("  - Residual bits per subspace: %zu\n",
+            jhq.residual_bits_per_subspace);
+        printf("  - Early termination: %s\n",
+            use_early_termination ? "enabled" : "disabled");
+        printf("  - Oversampling factor: %.1f\n", default_jhq_oversampling);
+        printf("  - Memory layout: %s\n",
+            jhq.memory_layout_initialized_ ? "optimized" : "standard");
+        printf("  - Estimated memory: %.2f MB\n",
+            get_memory_usage() / (1024.0 * 1024.0));
     }
 }
 
@@ -1290,6 +1535,10 @@ void IndexIVFJHQ::benchmark_search(idx_t nq,
         printf("Index not trained - cannot benchmark\n");
         return;
     }
+
+    printf("Benchmarking IndexIVFJHQ search performance:\n");
+    printf("  Queries: %zd, k: %zd, nprobe: %zd\n", nq, k, nprobe_val);
+    printf("  Runs: %d\n", num_runs);
 
     std::vector<float> distances(nq * k);
     std::vector<idx_t> labels(nq * k);
@@ -1470,6 +1719,12 @@ InvertedListScanner* IndexIVFJHQ::get_InvertedListScanner(
     const IDSelector* sel,
     const IVFSearchParameters* params_in) const
 {
+    if (should_use_single_level_adapter()) {
+        ensure_single_level_adapter_ready();
+        return single_level_adapter_->get_InvertedListScanner(
+            store_pairs, sel, params_in);
+    }
+
     const IVFJHQSearchParameters* jhq_params = dynamic_cast<const IVFJHQSearchParameters*>(params_in);
 
     return new IVFJHQScanner(*this, store_pairs, sel, jhq_params);
@@ -1692,6 +1947,12 @@ float IVFJHQScanner::distance_to_code_separated_storage(size_t offset_in_list) c
     if (compute_residuals && index.jhq.num_levels > 1) {
         const uint8_t* residual_codes = index.jhq.separated_codes_.get_residual_codes(global_vec_idx);
         total_distance += compute_residual_distance_separated_storage(residual_codes);
+        total_distance += jhq_internal::compute_cross_term_from_codes(
+            index.jhq,
+            primary_codes,
+            residual_codes,
+            index.jhq.separated_codes_.residual_subspace_stride,
+            index.jhq.separated_codes_.residual_level_stride);
     }
 
     return total_distance;
@@ -1898,6 +2159,13 @@ float IVFJHQScanner::distance_to_code_pre_decoded(
 
     if (compute_residuals && index.jhq.num_levels > 1) {
         total_distance += compute_residual_distance_pre_decoded(vector_idx_in_list);
+        const uint8_t* residual_codes = current_list_pre_decoded->get_residual_codes(vector_idx_in_list);
+        total_distance += jhq_internal::compute_cross_term_from_codes(
+            index.jhq,
+            primary_codes,
+            residual_codes,
+            current_list_pre_decoded->residual_subspace_stride,
+            current_list_pre_decoded->residual_level_stride);
     }
 
     return total_distance;
@@ -1907,8 +2175,25 @@ float IVFJHQScanner::compute_residual_distance_pre_decoded(
     size_t vector_idx_in_list) const
 {
     const uint8_t* residual_codes = current_list_pre_decoded->get_residual_codes(vector_idx_in_list);
+    const ProductQuantizer* residual_pq = index.jhq.get_residual_product_quantizer();
     float residual_distance = 0.0f;
     size_t residual_offset = 0;
+
+    if (residual_pq && index.jhq.num_levels == 2) {
+        const int K_res = 1 << index.jhq.level_bits[1];
+        const size_t level_offset = jhq_residual_offsets[1];
+
+        for (int m = 0; m < index.jhq.M; ++m) {
+            for (int d = 0; d < index.jhq.Ds; ++d) {
+                const uint8_t scalar_id = residual_codes[residual_offset++];
+                const size_t table_idx = level_offset +
+                    (size_t)m * index.jhq.Ds * K_res + (size_t)d * K_res + scalar_id;
+                residual_distance += jhq_residual_tables[table_idx];
+            }
+        }
+
+        return residual_distance;
+    }
 
     for (int m = 0; m < index.jhq.M; ++m) {
         if (m + 1 < index.jhq.M) {
@@ -1945,8 +2230,8 @@ float IVFJHQScanner::compute_residual_distance_pre_decoded(
 
                     table_indices = _mm512_add_epi32(table_indices, scalar_ids);
 
-                    __m512 distances = _mm512_i32gather_ps(table_indices,
-                        jhq_residual_tables.data(), 4);
+                    __m512 distances = _mm512_i32gather_ps(
+                        table_indices, jhq_residual_tables.data(), 4);
                     acc = _mm512_add_ps(acc, distances);
                 }
 
@@ -2015,25 +2300,64 @@ float IVFJHQScanner::distance_to_code_with_bit_decoding(
     JHQDecoder decoder(code);
     float total_distance = 0.0f;
     const int K0 = 1 << index.jhq.level_bits[0];
+    float cross_term = 0.0f;
+    std::vector<float> residual_buffer(
+        compute_residuals && index.jhq.num_levels > 1 ? index.jhq.Ds : 0);
+
+    const uint32_t primary_limit = static_cast<uint32_t>(K0 - 1);
 
     for (int m = 0; m < index.jhq.M; ++m) {
         uint32_t centroid_id = decoder.decode(index.jhq.level_bits[0]);
+        centroid_id = std::min(centroid_id, primary_limit);
         total_distance += jhq_primary_tables[m * K0 + centroid_id];
 
         if (compute_residuals && index.jhq.num_levels > 1) {
+            std::fill(residual_buffer.begin(), residual_buffer.end(), 0.0f);
+
+            const auto& centroids = index.jhq.codewords[m][0];
+            const int num_centroids = centroids.empty() ? 0 : static_cast<int>(centroids.size() / index.jhq.Ds);
+            const uint32_t safe_centroid = centroids.empty()
+                ? 0
+                : std::min<uint32_t>(centroid_id, static_cast<uint32_t>(std::max(0, num_centroids - 1)));
+            const float* centroid_ptr = centroids.empty()
+                ? nullptr
+                : centroids.data() + static_cast<size_t>(safe_centroid) * index.jhq.Ds;
+
             for (int level = 1; level < index.jhq.num_levels; ++level) {
                 const int K_res = 1 << index.jhq.level_bits[level];
+                const uint32_t residual_limit = static_cast<uint32_t>(K_res - 1);
                 const size_t level_offset = jhq_residual_offsets[level];
+                const size_t table_base = level_offset + static_cast<size_t>(m) * index.jhq.Ds * K_res;
+                const auto& scalar_codebook = index.jhq.scalar_codebooks[m][level - 1];
+                const int codebook_size = static_cast<int>(scalar_codebook.size());
 
                 for (int d = 0; d < index.jhq.Ds; ++d) {
                     uint32_t scalar_id = decoder.decode(index.jhq.level_bits[level]);
-                    size_t table_idx = level_offset + m * index.jhq.Ds * K_res + d * K_res + scalar_id;
+                    scalar_id = std::min(scalar_id, residual_limit);
+                    const size_t table_idx = table_base + static_cast<size_t>(d) * K_res + scalar_id;
                     total_distance += jhq_residual_tables[table_idx];
+
+                    if (codebook_size > 0) {
+                        const uint32_t safe_scalar = std::min<uint32_t>(
+                            scalar_id,
+                            static_cast<uint32_t>(codebook_size - 1));
+                        residual_buffer[d] += scalar_codebook[safe_scalar];
+                    }
+                }
+            }
+
+            if (centroid_ptr) {
+                for (int d = 0; d < index.jhq.Ds; ++d) {
+                    cross_term += centroid_ptr[d] * residual_buffer[d];
                 }
             }
         } else {
             decoder.skip_bits(index.jhq.residual_bits_per_subspace);
         }
+    }
+
+    if (compute_residuals && index.jhq.num_levels > 1) {
+        total_distance += 2.0f * cross_term;
     }
 
     return total_distance;
@@ -2176,6 +2500,36 @@ void IVFJHQScanner::distance_four_codes_pre_decoded(const uint8_t* code1,
         dist2 += compute_residual_distance_pre_decoded(idx2);
         dist3 += compute_residual_distance_pre_decoded(idx3);
         dist4 += compute_residual_distance_pre_decoded(idx4);
+
+        const uint8_t* residual1 = current_list_pre_decoded->get_residual_codes(idx1);
+        const uint8_t* residual2 = current_list_pre_decoded->get_residual_codes(idx2);
+        const uint8_t* residual3 = current_list_pre_decoded->get_residual_codes(idx3);
+        const uint8_t* residual4 = current_list_pre_decoded->get_residual_codes(idx4);
+
+        dist1 += jhq_internal::compute_cross_term_from_codes(
+            index.jhq,
+            primary1,
+            residual1,
+            current_list_pre_decoded->residual_subspace_stride,
+            current_list_pre_decoded->residual_level_stride);
+        dist2 += jhq_internal::compute_cross_term_from_codes(
+            index.jhq,
+            primary2,
+            residual2,
+            current_list_pre_decoded->residual_subspace_stride,
+            current_list_pre_decoded->residual_level_stride);
+        dist3 += jhq_internal::compute_cross_term_from_codes(
+            index.jhq,
+            primary3,
+            residual3,
+            current_list_pre_decoded->residual_subspace_stride,
+            current_list_pre_decoded->residual_level_stride);
+        dist4 += jhq_internal::compute_cross_term_from_codes(
+            index.jhq,
+            primary4,
+            residual4,
+            current_list_pre_decoded->residual_subspace_stride,
+            current_list_pre_decoded->residual_level_stride);
     }
 }
 
@@ -2203,6 +2557,7 @@ void IVFJHQScanner::distance_four_codes_with_bit_decoding(
 
 #ifdef __AVX2__
     __m128 distances = _mm_setzero_ps();
+    float cross_terms[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     const int K0 = 1 << index.jhq.level_bits[0];
 
     for (int m = 0; m < index.jhq.M; ++m) {
@@ -2221,6 +2576,21 @@ void IVFJHQScanner::distance_four_codes_with_bit_decoding(
             decoders[3].decode(index.jhq.level_bits[0]),
             static_cast<uint32_t>(K0 - 1));
 
+        const auto& centroids = index.jhq.codewords[m][0];
+        const size_t centroid_block = index.jhq.Ds;
+        const float* centroid_ptr0 = (centroids.empty() || centroid_block == 0)
+            ? nullptr
+            : centroids.data() + static_cast<size_t>(id0) * centroid_block;
+        const float* centroid_ptr1 = (centroids.empty() || centroid_block == 0)
+            ? nullptr
+            : centroids.data() + static_cast<size_t>(id1) * centroid_block;
+        const float* centroid_ptr2 = (centroids.empty() || centroid_block == 0)
+            ? nullptr
+            : centroids.data() + static_cast<size_t>(id2) * centroid_block;
+        const float* centroid_ptr3 = (centroids.empty() || centroid_block == 0)
+            ? nullptr
+            : centroids.data() + static_cast<size_t>(id3) * centroid_block;
+
         __m128i indices = _mm_set_epi32(id3, id2, id1, id0);
         __m128 primary_dists = _mm_i32gather_ps(table_base, indices, 4);
 
@@ -2230,6 +2600,8 @@ void IVFJHQScanner::distance_four_codes_with_bit_decoding(
             for (int level = 1; level < index.jhq.num_levels; ++level) {
                 const int K_res = 1 << index.jhq.level_bits[level];
                 const size_t level_offset = jhq_residual_offsets[level];
+                const auto& scalar_codebook = index.jhq.scalar_codebooks[m][level - 1];
+                const int codebook_size = static_cast<int>(scalar_codebook.size());
 
                 for (int d = 0; d < index.jhq.Ds; ++d) {
                     alignas(16) uint32_t scalar_ids[4];
@@ -2247,6 +2619,28 @@ void IVFJHQScanner::distance_four_codes_with_bit_decoding(
 
                     __m128 residual_dists = _mm_i32gather_ps(res_table, res_indices, 4);
                     distances = _mm_add_ps(distances, residual_dists);
+
+                    if (codebook_size > 0) {
+                        const float centroid_vals[4] = {
+                            centroid_ptr0 ? centroid_ptr0[d] : 0.0f,
+                            centroid_ptr1 ? centroid_ptr1[d] : 0.0f,
+                            centroid_ptr2 ? centroid_ptr2[d] : 0.0f,
+                            centroid_ptr3 ? centroid_ptr3[d] : 0.0f
+                        };
+                        const uint32_t safe_idx0 = std::min(
+                            scalar_ids[0], static_cast<uint32_t>(codebook_size - 1));
+                        const uint32_t safe_idx1 = std::min(
+                            scalar_ids[1], static_cast<uint32_t>(codebook_size - 1));
+                        const uint32_t safe_idx2 = std::min(
+                            scalar_ids[2], static_cast<uint32_t>(codebook_size - 1));
+                        const uint32_t safe_idx3 = std::min(
+                            scalar_ids[3], static_cast<uint32_t>(codebook_size - 1));
+
+                        cross_terms[0] += centroid_vals[0] * scalar_codebook[safe_idx0];
+                        cross_terms[1] += centroid_vals[1] * scalar_codebook[safe_idx1];
+                        cross_terms[2] += centroid_vals[2] * scalar_codebook[safe_idx2];
+                        cross_terms[3] += centroid_vals[3] * scalar_codebook[safe_idx3];
+                    }
                 }
             }
         } else {
@@ -2259,13 +2653,14 @@ void IVFJHQScanner::distance_four_codes_with_bit_decoding(
 
     alignas(16) float result[4];
     _mm_store_ps(result, distances);
-    dist1 = result[0];
-    dist2 = result[1];
-    dist3 = result[2];
-    dist4 = result[3];
+    dist1 = result[0] + (compute_residuals && index.jhq.num_levels > 1 ? 2.0f * cross_terms[0] : 0.0f);
+    dist2 = result[1] + (compute_residuals && index.jhq.num_levels > 1 ? 2.0f * cross_terms[1] : 0.0f);
+    dist3 = result[2] + (compute_residuals && index.jhq.num_levels > 1 ? 2.0f * cross_terms[2] : 0.0f);
+    dist4 = result[3] + (compute_residuals && index.jhq.num_levels > 1 ? 2.0f * cross_terms[3] : 0.0f);
 
 #else
     dist1 = dist2 = dist3 = dist4 = 0.0f;
+    float cross_terms[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     const int K0 = 1 << index.jhq.level_bits[0];
 
     for (int m = 0; m < index.jhq.M; ++m) {
@@ -2284,10 +2679,23 @@ void IVFJHQScanner::distance_four_codes_with_bit_decoding(
         dist4 += table_base[std::min(
             centroid_ids[3], static_cast<uint32_t>(K0 - 1))];
 
+        const auto& centroids = index.jhq.codewords[m][0];
+        const size_t centroid_block = index.jhq.Ds;
+        const float* centroid_ptrs[4];
+        for (int i = 0; i < 4; ++i) {
+            if (centroids.empty() || centroid_block == 0) {
+                centroid_ptrs[i] = nullptr;
+            } else {
+                centroid_ptrs[i] = centroids.data() + static_cast<size_t>(centroid_ids[i]) * centroid_block;
+            }
+        }
+
         if (compute_residuals && index.jhq.num_levels > 1) {
             for (int level = 1; level < index.jhq.num_levels; ++level) {
                 const int K_res = 1 << index.jhq.level_bits[level];
                 const size_t level_offset = jhq_residual_offsets[level];
+                const auto& scalar_codebook = index.jhq.scalar_codebooks[m][level - 1];
+                const int codebook_size = static_cast<int>(scalar_codebook.size());
 
                 for (int d = 0; d < index.jhq.Ds; ++d) {
                     uint32_t scalar_ids[4];
@@ -2306,6 +2714,17 @@ void IVFJHQScanner::distance_four_codes_with_bit_decoding(
                         scalar_ids[2], static_cast<uint32_t>(K_res - 1))];
                     dist4 += res_table[std::min(
                         scalar_ids[3], static_cast<uint32_t>(K_res - 1))];
+
+                    if (codebook_size > 0) {
+                        for (int i = 0; i < 4; ++i) {
+                            if (!centroid_ptrs[i]) {
+                                continue;
+                            }
+                            const uint32_t safe_idx = std::min(
+                                scalar_ids[i], static_cast<uint32_t>(codebook_size - 1));
+                            cross_terms[i] += centroid_ptrs[i][d] * scalar_codebook[safe_idx];
+                        }
+                    }
                 }
             }
         } else {
@@ -2314,6 +2733,13 @@ void IVFJHQScanner::distance_four_codes_with_bit_decoding(
                 decoders[i].skip_bits(skip_bits);
             }
         }
+    }
+
+    if (compute_residuals && index.jhq.num_levels > 1) {
+        dist1 += 2.0f * cross_terms[0];
+        dist2 += 2.0f * cross_terms[1];
+        dist3 += 2.0f * cross_terms[2];
+        dist4 += 2.0f * cross_terms[3];
     }
 #endif
 }
@@ -2335,6 +2761,7 @@ void IVFJHQScanner::distance_sixteen_codes(
 
 #ifdef __AVX512F__
     __m512 total_distances = _mm512_setzero_ps();
+    float cross_terms[16] = { 0.0f };
     const int K0 = 1 << index.jhq.level_bits[0];
 
     for (int m = 0; m < index.jhq.M; ++m) {
@@ -2344,6 +2771,16 @@ void IVFJHQScanner::distance_sixteen_codes(
         }
 
         const float* table_base = jhq_primary_tables.data() + m * K0;
+        const auto& centroids = index.jhq.codewords[m][0];
+        const size_t centroid_block = index.jhq.Ds;
+        const float* centroid_ptrs[16];
+        for (int i = 0; i < 16; ++i) {
+            if (centroids.empty() || centroid_block == 0) {
+                centroid_ptrs[i] = nullptr;
+            } else {
+                centroid_ptrs[i] = centroids.data() + static_cast<size_t>(centroid_ids[i]) * centroid_block;
+            }
+        }
         __m512i indices = _mm512_loadu_si512(
             reinterpret_cast<const __m512i*>(centroid_ids));
         __m512 primary_dists = _mm512_i32gather_ps(indices, table_base, 4);
@@ -2353,6 +2790,8 @@ void IVFJHQScanner::distance_sixteen_codes(
             for (int level = 1; level < index.jhq.num_levels; ++level) {
                 const int K_res = 1 << index.jhq.level_bits[level];
                 const size_t level_offset = jhq_residual_offsets[level];
+                const auto& scalar_codebook = index.jhq.scalar_codebooks[m][level - 1];
+                const int codebook_size = static_cast<int>(scalar_codebook.size());
 
                 for (int d = 0; d < index.jhq.Ds; ++d) {
                     alignas(64) uint32_t scalar_ids[16];
@@ -2367,6 +2806,17 @@ void IVFJHQScanner::distance_sixteen_codes(
                         reinterpret_cast<const __m512i*>(scalar_ids));
                     __m512 residual_dists = _mm512_i32gather_ps(res_indices, res_table, 4);
                     total_distances = _mm512_add_ps(total_distances, residual_dists);
+
+                    if (codebook_size > 0) {
+                        for (int i = 0; i < 16; ++i) {
+                            if (!centroid_ptrs[i]) {
+                                continue;
+                            }
+                            const uint32_t safe_idx = std::min(
+                                scalar_ids[i], static_cast<uint32_t>(codebook_size - 1));
+                            cross_terms[i] += centroid_ptrs[i][d] * scalar_codebook[safe_idx];
+                        }
+                    }
                 }
             }
         } else {
@@ -2378,19 +2828,34 @@ void IVFJHQScanner::distance_sixteen_codes(
     }
 
     _mm512_storeu_ps(distances, total_distances);
+    if (compute_residuals && index.jhq.num_levels > 1) {
+        for (int i = 0; i < 16; ++i) {
+            distances[i] += 2.0f * cross_terms[i];
+        }
+    }
 
 #elif defined(__AVX2__)
     const int K0 = 1 << index.jhq.level_bits[0];
+    float cross_terms[16] = { 0.0f };
 
     for (int i = 0; i < 16; ++i) {
         distances[i] = 0.0f;
     }
 
     for (int m = 0; m < index.jhq.M; ++m) {
+        const auto& centroids = index.jhq.codewords[m][0];
+        const size_t centroid_block = index.jhq.Ds;
+        const float* centroid_ptrs[16];
+
         {
             alignas(32) uint32_t centroid_ids[8];
             for (int i = 0; i < 8; ++i) {
                 centroid_ids[i] = decoders[i].decode(index.jhq.level_bits[0]);
+                if (centroids.empty() || centroid_block == 0) {
+                    centroid_ptrs[i] = nullptr;
+                } else {
+                    centroid_ptrs[i] = centroids.data() + static_cast<size_t>(centroid_ids[i]) * centroid_block;
+                }
             }
 
             const float* table_base = jhq_primary_tables.data() + m * K0;
@@ -2407,6 +2872,11 @@ void IVFJHQScanner::distance_sixteen_codes(
             alignas(32) uint32_t centroid_ids[8];
             for (int i = 0; i < 8; ++i) {
                 centroid_ids[i] = decoders[i + 8].decode(index.jhq.level_bits[0]);
+                if (centroids.empty() || centroid_block == 0) {
+                    centroid_ptrs[i + 8] = nullptr;
+                } else {
+                    centroid_ptrs[i + 8] = centroids.data() + static_cast<size_t>(centroid_ids[i]) * centroid_block;
+                }
             }
 
             const float* table_base = jhq_primary_tables.data() + m * K0;
@@ -2442,6 +2912,17 @@ void IVFJHQScanner::distance_sixteen_codes(
                         __m256 current_dists = _mm256_loadu_ps(&distances[0]);
                         current_dists = _mm256_add_ps(current_dists, residual_dists);
                         _mm256_storeu_ps(&distances[0], current_dists);
+
+                        if (codebook_size > 0) {
+                            for (int i = 0; i < 8; ++i) {
+                                if (!centroid_ptrs[i]) {
+                                    continue;
+                                }
+                                const uint32_t safe_idx = std::min(
+                                    scalar_ids[i], static_cast<uint32_t>(codebook_size - 1));
+                                cross_terms[i] += centroid_ptrs[i][d] * scalar_codebook[safe_idx];
+                            }
+                        }
                     }
 
                     {
@@ -2458,6 +2939,17 @@ void IVFJHQScanner::distance_sixteen_codes(
                         __m256 current_dists = _mm256_loadu_ps(&distances[8]);
                         current_dists = _mm256_add_ps(current_dists, residual_dists);
                         _mm256_storeu_ps(&distances[8], current_dists);
+
+                        if (codebook_size > 0) {
+                            for (int i = 0; i < 8; ++i) {
+                                if (!centroid_ptrs[i + 8]) {
+                                    continue;
+                                }
+                                const uint32_t safe_idx = std::min(
+                                    scalar_ids[i], static_cast<uint32_t>(codebook_size - 1));
+                                cross_terms[i + 8] += centroid_ptrs[i + 8][d] * scalar_codebook[safe_idx];
+                            }
+                        }
                     }
                 }
             }
@@ -2466,6 +2958,12 @@ void IVFJHQScanner::distance_sixteen_codes(
             for (int i = 0; i < 16; ++i) {
                 decoders[i].skip_bits(skip_bits);
             }
+        }
+    }
+
+    if (compute_residuals && index.jhq.num_levels > 1) {
+        for (int i = 0; i < 16; ++i) {
+            distances[i] += 2.0f * cross_terms[i];
         }
     }
 
@@ -2556,6 +3054,13 @@ size_t IVFJHQScanner::scan_codes_exhaustive(
 
     index.heap_batch_buffer.clear();
 
+    if (!is_max_heap) {
+        compute_primary_distances(list_size, codes);
+        quantize_primary_distances(list_size);
+        return scan_codes_exhaustive_l2_gated(
+            list_size, codes, ids, simi, idxi, k);
+    }
+
     if (k <= 8) {
         return scan_codes_small_k_simd(list_size, codes, ids, simi, idxi, k);
     }
@@ -2565,13 +3070,6 @@ size_t IVFJHQScanner::scan_codes_exhaustive(
     size_t saved_j[16];
 
     for (size_t j = 0; j < list_size; j++) {
-        if (sel != nullptr) {
-            idx_t id = store_pairs ? lo_build(list_no, j) : ids[j];
-            if (!sel->is_member(id)) {
-                continue;
-            }
-        }
-
         saved_j[counter] = j;
         counter++;
 
@@ -2600,14 +3098,7 @@ size_t IVFJHQScanner::scan_codes_exhaustive(
     int counter = 0;
     size_t saved_j[4] = { 0, 0, 0, 0 };
 
-    for (size_t j = 0; j < list_size; j++) {
-        if (sel != nullptr) {
-            idx_t id = store_pairs ? lo_build(list_no, j) : ids[j];
-            if (!sel->is_member(id)) {
-                continue;
-            }
-        }
-
+   for (size_t j = 0; j < list_size; j++) {
         saved_j[counter] = j;
         counter++;
 
@@ -2648,6 +3139,44 @@ size_t IVFJHQScanner::scan_codes_exhaustive(
     return nup;
 }
 
+size_t IVFJHQScanner::scan_codes_exhaustive_l2_gated(
+    size_t list_size,
+    const uint8_t* codes,
+    const idx_t* ids,
+    float* simi,
+    idx_t* idxi,
+    size_t k) const
+{
+    size_t nup = 0;
+    const bool has_quantized = workspace_primary_distances_quantized.size() == list_size;
+    const float* primary_distances = workspace_primary_distances.data();
+
+    for (size_t j = 0; j < list_size; ++j) {
+        if (!passes_selector(j, ids)) {
+            continue;
+        }
+
+        float primary_dist = has_quantized
+            ? reconstruct_primary_distance(workspace_primary_distances_quantized[j])
+            : primary_distances[j];
+
+        if (primary_dist >= simi[0]) {
+            continue;
+        }
+
+        float dis = distance_to_code(codes + j * code_size);
+        if (dis >= simi[0]) {
+            continue;
+        }
+
+        idx_t id = get_candidate_id(j, ids);
+        heap_replace_top<CMax<float, idx_t>>(k, simi, idxi, dis, id);
+        nup++;
+    }
+
+    return nup;
+}
+
 size_t IVFJHQScanner::scan_codes_early_termination(
     size_t list_size,
     const uint8_t* codes,
@@ -2680,6 +3209,7 @@ size_t IVFJHQScanner::scan_codes_early_termination(
     select_top_candidates(primary_distances_ptr, list_size, n_candidates);
 
     workspace_candidate_indices.resize(n_candidates);
+    quantize_primary_distances(list_size);
 
     size_t nup = 0;
     bool is_max_heap = (index.metric_type == METRIC_INNER_PRODUCT);
@@ -2691,78 +3221,103 @@ size_t IVFJHQScanner::scan_codes_early_termination(
         size_t j2 = workspace_candidate_indices[i + 2];
         size_t j3 = workspace_candidate_indices[i + 3];
 
-        bool valid[4] = { true, true, true, true };
-        if (sel != nullptr) {
-            valid[0] = sel->is_member(
-                store_pairs ? lo_build(list_no, j0) : ids[j0]);
-            valid[1] = sel->is_member(
-                store_pairs ? lo_build(list_no, j1) : ids[j1]);
-            valid[2] = sel->is_member(
-                store_pairs ? lo_build(list_no, j2) : ids[j2]);
-            valid[3] = sel->is_member(
-                store_pairs ? lo_build(list_no, j3) : ids[j3]);
+        bool valid0 = passes_selector(j0, ids);
+        bool valid1 = passes_selector(j1, ids);
+        bool valid2 = passes_selector(j2, ids);
+        bool valid3 = passes_selector(j3, ids);
+
+        if (!valid0 && !valid1 && !valid2 && !valid3) {
+            continue;
         }
 
-        if (valid[0] || valid[1] || valid[2] || valid[3]) {
-            float dist0, dist1, dist2, dist3;
-            distance_four_codes(codes + j0 * code_size,
-                codes + j1 * code_size,
-                codes + j2 * code_size,
-                codes + j3 * code_size,
-                dist0,
-                dist1,
-                dist2,
-                dist3);
-
-            if (valid[0]) {
-                bool should_update = is_max_heap ? (dist0 > simi[0]) : (dist0 < simi[0]);
-                if (should_update) {
-                    idx_t id = store_pairs ? lo_build(list_no, j0) : ids[j0];
-                    if (is_max_heap) {
-                        minheap_replace_top(k, simi, idxi, dist0, id);
-                    } else {
-                        maxheap_replace_top(k, simi, idxi, dist0, id);
+        if (valid0) {
+            idx_t id = get_candidate_id(j0, ids);
+            float primary_dist = reconstruct_primary_distance(
+                workspace_primary_distances_quantized[j0]);
+            bool promising = is_max_heap || CMin<float, idx_t>::cmp(primary_dist, simi[0]);
+            if (promising) {
+                float dist0 = distance_to_code(codes + j0 * code_size);
+                if (is_max_heap) {
+                    if (CMin<float, idx_t>::cmp(simi[0], dist0)) {
+                        faiss::heap_replace_top<CMin<float, idx_t>>(
+                            k, simi, idxi, dist0, id);
+                        nup++;
                     }
-                    nup++;
+                } else {
+                    if (CMax<float, idx_t>::cmp(simi[0], dist0)) {
+                        faiss::heap_replace_top<CMax<float, idx_t>>(
+                            k, simi, idxi, dist0, id);
+                        nup++;
+                    }
                 }
             }
+        }
 
-            if (valid[1]) {
-                bool should_update = is_max_heap ? (dist1 > simi[0]) : (dist1 < simi[0]);
-                if (should_update) {
-                    idx_t id = store_pairs ? lo_build(list_no, j1) : ids[j1];
-                    if (is_max_heap) {
-                        minheap_replace_top(k, simi, idxi, dist1, id);
-                    } else {
-                        maxheap_replace_top(k, simi, idxi, dist1, id);
+        if (valid1) {
+            idx_t id = get_candidate_id(j1, ids);
+            float primary_dist = reconstruct_primary_distance(
+                workspace_primary_distances_quantized[j1]);
+            bool promising = is_max_heap || CMin<float, idx_t>::cmp(primary_dist, simi[0]);
+            if (promising) {
+                float dist1 = distance_to_code(codes + j1 * code_size);
+                if (is_max_heap) {
+                    if (CMin<float, idx_t>::cmp(simi[0], dist1)) {
+                        faiss::heap_replace_top<CMin<float, idx_t>>(
+                            k, simi, idxi, dist1, id);
+                        nup++;
                     }
-                    nup++;
+                } else {
+                    if (CMax<float, idx_t>::cmp(simi[0], dist1)) {
+                        faiss::heap_replace_top<CMax<float, idx_t>>(
+                            k, simi, idxi, dist1, id);
+                        nup++;
+                    }
                 }
             }
+        }
 
-            if (valid[2]) {
-                bool should_update = is_max_heap ? (dist2 > simi[0]) : (dist2 < simi[0]);
-                if (should_update) {
-                    idx_t id = store_pairs ? lo_build(list_no, j2) : ids[j2];
-                    if (is_max_heap) {
-                        minheap_replace_top(k, simi, idxi, dist2, id);
-                    } else {
-                        maxheap_replace_top(k, simi, idxi, dist2, id);
+        if (valid2) {
+            idx_t id = get_candidate_id(j2, ids);
+            float primary_dist = reconstruct_primary_distance(
+                workspace_primary_distances_quantized[j2]);
+            bool promising = is_max_heap || CMin<float, idx_t>::cmp(primary_dist, simi[0]);
+            if (promising) {
+                float dist2 = distance_to_code(codes + j2 * code_size);
+                if (is_max_heap) {
+                    if (CMin<float, idx_t>::cmp(simi[0], dist2)) {
+                        faiss::heap_replace_top<CMin<float, idx_t>>(
+                            k, simi, idxi, dist2, id);
+                        nup++;
                     }
-                    nup++;
+                } else {
+                    if (CMax<float, idx_t>::cmp(simi[0], dist2)) {
+                        faiss::heap_replace_top<CMax<float, idx_t>>(
+                            k, simi, idxi, dist2, id);
+                        nup++;
+                    }
                 }
             }
+        }
 
-            if (valid[3]) {
-                bool should_update = is_max_heap ? (dist3 > simi[0]) : (dist3 < simi[0]);
-                if (should_update) {
-                    idx_t id = store_pairs ? lo_build(list_no, j3) : ids[j3];
-                    if (is_max_heap) {
-                        minheap_replace_top(k, simi, idxi, dist3, id);
-                    } else {
-                        maxheap_replace_top(k, simi, idxi, dist3, id);
+        if (valid3) {
+            idx_t id = get_candidate_id(j3, ids);
+            float primary_dist = reconstruct_primary_distance(
+                workspace_primary_distances_quantized[j3]);
+            bool promising = is_max_heap || CMin<float, idx_t>::cmp(primary_dist, simi[0]);
+            if (promising) {
+                float dist3 = distance_to_code(codes + j3 * code_size);
+                if (is_max_heap) {
+                    if (CMin<float, idx_t>::cmp(simi[0], dist3)) {
+                        faiss::heap_replace_top<CMin<float, idx_t>>(
+                            k, simi, idxi, dist3, id);
+                        nup++;
                     }
-                    nup++;
+                } else {
+                    if (CMax<float, idx_t>::cmp(simi[0], dist3)) {
+                        faiss::heap_replace_top<CMax<float, idx_t>>(
+                            k, simi, idxi, dist3, id);
+                        nup++;
+                    }
                 }
             }
         }
@@ -2771,24 +3326,33 @@ size_t IVFJHQScanner::scan_codes_early_termination(
     for (; i < n_candidates; ++i) {
         size_t j = workspace_candidate_indices[i];
 
-        if (sel != nullptr) {
-            idx_t id = store_pairs ? lo_build(list_no, j) : ids[j];
-            if (!sel->is_member(id))
-                continue;
+        if (!passes_selector(j, ids)) {
+            continue;
+        }
+
+        idx_t id = get_candidate_id(j, ids);
+        float primary_dist = reconstruct_primary_distance(
+            workspace_primary_distances_quantized[j]);
+        bool promising = is_max_heap || CMin<float, idx_t>::cmp(primary_dist, simi[0]);
+        if (!promising) {
+            continue;
         }
 
         const uint8_t* code = codes + j * code_size;
         float dis = distance_to_code(code);
 
-        bool should_update = is_max_heap ? (dis > simi[0]) : (dis < simi[0]);
-        if (should_update) {
-            idx_t id = store_pairs ? lo_build(list_no, j) : ids[j];
-            if (is_max_heap) {
-                minheap_replace_top(k, simi, idxi, dis, id);
-            } else {
-                maxheap_replace_top(k, simi, idxi, dis, id);
+        if (is_max_heap) {
+            if (CMin<float, idx_t>::cmp(simi[0], dis)) {
+                faiss::heap_replace_top<CMin<float, idx_t>>(
+                    k, simi, idxi, dis, id);
+                nup++;
             }
-            nup++;
+        } else {
+            if (CMax<float, idx_t>::cmp(simi[0], dis)) {
+                faiss::heap_replace_top<CMax<float, idx_t>>(
+                    k, simi, idxi, dis, id);
+                nup++;
+            }
         }
     }
 
@@ -2834,22 +3398,25 @@ size_t IVFJHQScanner::scan_codes_k4_unrolled(size_t list_size,
             distances[3]);
 
         for (int i = 0; i < 4; ++i) {
-            if (sel != nullptr) {
-                idx_t id = store_pairs ? lo_build(list_no, j + i) : ids[j + i];
-                if (!sel->is_member(id))
-                    continue;
+            size_t idx_offset = j + i;
+            if (!passes_selector(idx_offset, ids)) {
+                continue;
             }
 
-            bool should_update = is_max_heap ? (distances[i] > simi[0])
-                                             : (distances[i] < simi[0]);
-            if (should_update) {
-                idx_t id = store_pairs ? lo_build(list_no, j + i) : ids[j + i];
-                if (is_max_heap) {
-                    minheap_replace_top(k, simi, idxi, distances[i], id);
-                } else {
-                    maxheap_replace_top(k, simi, idxi, distances[i], id);
+            idx_t id = get_candidate_id(idx_offset, ids);
+
+            if (is_max_heap) {
+                if (CMin<float, idx_t>::cmp(simi[0], distances[i])) {
+                    faiss::heap_replace_top<CMin<float, idx_t>>(
+                        k, simi, idxi, distances[i], id);
+                    nup++;
                 }
-                nup++;
+            } else {
+                if (CMax<float, idx_t>::cmp(simi[0], distances[i])) {
+                    faiss::heap_replace_top<CMax<float, idx_t>>(
+                        k, simi, idxi, distances[i], id);
+                    nup++;
+                }
             }
         }
     }
@@ -2868,7 +3435,8 @@ size_t IVFJHQScanner::scan_codes_k8_unrolled(size_t list_size,
     bool is_max_heap = (index.metric_type == METRIC_INNER_PRODUCT);
 
     for (size_t j = 0; j + 7 < list_size; j += 8) {
-        float distances1[4], distances2[4];
+        float distances1[4];
+        float distances2[4];
 
         distance_four_codes(codes + j * code_size,
             codes + (j + 1) * code_size,
@@ -2889,66 +3457,72 @@ size_t IVFJHQScanner::scan_codes_k8_unrolled(size_t list_size,
             distances2[3]);
 
         for (int i = 0; i < 4; ++i) {
-            if (sel != nullptr) {
-                idx_t id = store_pairs ? lo_build(list_no, j + i) : ids[j + i];
-                if (!sel->is_member(id))
-                    continue;
+            size_t idx_offset = j + i;
+            if (!passes_selector(idx_offset, ids)) {
+                continue;
             }
 
-            bool should_update = is_max_heap ? (distances1[i] > simi[0])
-                                             : (distances1[i] < simi[0]);
-            if (should_update) {
-                idx_t id = store_pairs ? lo_build(list_no, j + i) : ids[j + i];
-                if (is_max_heap) {
-                    minheap_replace_top(k, simi, idxi, distances1[i], id);
-                } else {
-                    maxheap_replace_top(k, simi, idxi, distances1[i], id);
+            idx_t id = get_candidate_id(idx_offset, ids);
+
+            if (is_max_heap) {
+                if (CMin<float, idx_t>::cmp(simi[0], distances1[i])) {
+                    faiss::heap_replace_top<CMin<float, idx_t>>(
+                        k, simi, idxi, distances1[i], id);
+                    nup++;
                 }
-                nup++;
+            } else {
+                if (CMax<float, idx_t>::cmp(simi[0], distances1[i])) {
+                    faiss::heap_replace_top<CMax<float, idx_t>>(
+                        k, simi, idxi, distances1[i], id);
+                    nup++;
+                }
             }
         }
 
         for (int i = 0; i < 4; ++i) {
-            if (sel != nullptr) {
-                idx_t id = store_pairs ? lo_build(list_no, j + 4 + i)
-                                       : ids[j + 4 + i];
-                if (!sel->is_member(id))
-                    continue;
+            size_t idx_offset = j + 4 + i;
+            if (!passes_selector(idx_offset, ids)) {
+                continue;
             }
 
-            bool should_update = is_max_heap ? (distances2[i] > simi[0])
-                                             : (distances2[i] < simi[0]);
-            if (should_update) {
-                idx_t id = store_pairs ? lo_build(list_no, j + 4 + i)
-                                       : ids[j + 4 + i];
-                if (is_max_heap) {
-                    minheap_replace_top(k, simi, idxi, distances2[i], id);
-                } else {
-                    maxheap_replace_top(k, simi, idxi, distances2[i], id);
+            idx_t id = get_candidate_id(idx_offset, ids);
+
+            if (is_max_heap) {
+                if (CMin<float, idx_t>::cmp(simi[0], distances2[i])) {
+                    faiss::heap_replace_top<CMin<float, idx_t>>(
+                        k, simi, idxi, distances2[i], id);
+                    nup++;
                 }
-                nup++;
+            } else {
+                if (CMax<float, idx_t>::cmp(simi[0], distances2[i])) {
+                    faiss::heap_replace_top<CMax<float, idx_t>>(
+                        k, simi, idxi, distances2[i], id);
+                    nup++;
+                }
             }
         }
     }
 
     for (size_t j = (list_size / 8) * 8; j < list_size; ++j) {
-        if (sel != nullptr) {
-            idx_t id = store_pairs ? lo_build(list_no, j) : ids[j];
-            if (!sel->is_member(id))
-                continue;
+        if (!passes_selector(j, ids)) {
+            continue;
         }
 
         float distance = distance_to_code(codes + j * code_size);
-        bool should_update = is_max_heap ? (distance > simi[0]) : (distance < simi[0]);
+        idx_t id = get_candidate_id(j, ids);
 
-        if (should_update) {
-            idx_t id = store_pairs ? lo_build(list_no, j) : ids[j];
-            if (is_max_heap) {
-                minheap_replace_top(k, simi, idxi, distance, id);
-            } else {
-                maxheap_replace_top(k, simi, idxi, distance, id);
+        if (is_max_heap) {
+            if (CMin<float, idx_t>::cmp(simi[0], distance)) {
+                faiss::heap_replace_top<CMin<float, idx_t>>(
+                    k, simi, idxi, distance, id);
+                nup++;
             }
-            nup++;
+        } else {
+            if (CMax<float, idx_t>::cmp(simi[0], distance)) {
+                faiss::heap_replace_top<CMax<float, idx_t>>(
+                    k, simi, idxi, distance, id);
+                nup++;
+            }
         }
     }
 
@@ -3036,12 +3610,13 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
     float* distances) const {
 
     const int K0 = 1 << index.jhq.level_bits[0];
-    constexpr size_t CACHE_BATCH_SIZE = 128;
+    constexpr size_t CACHE_BATCH_SIZE = 128; // Increased for better cache utilization
 
-#pragma omp parallel for schedule(static) if (list_size > 2000)
+#pragma omp parallel for schedule(static) if (list_size > 2000) // Lower threshold
     for (size_t batch_start = 0; batch_start < list_size; batch_start += CACHE_BATCH_SIZE) {
         const size_t batch_end = std::min(list_size, batch_start + CACHE_BATCH_SIZE);
 
+        // Enhanced prefetching with multiple streams
         for (size_t i = batch_start; i < batch_end; i += 16) {
             const size_t prefetch_end = std::min(batch_end, i + 64);
             for (size_t j = i; j < prefetch_end; j += 8) {
@@ -3050,12 +3625,13 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
                     if (global_idx >= 0) {
                         const uint8_t* primary_codes = index.jhq.separated_codes_.get_primary_codes(global_idx);
                         _mm_prefetch(primary_codes, _MM_HINT_T0);
-                        _mm_prefetch(primary_codes + 32, _MM_HINT_T0);
+                        _mm_prefetch(primary_codes + 32, _MM_HINT_T0); // Next cache line
                     }
                 }
             }
         }
 
+        // Process batch with enhanced SIMD
         for (size_t offset_in_list = batch_start; offset_in_list < batch_end; ++offset_in_list) {
             const idx_t global_vec_idx = index.get_global_vector_index(list_no, offset_in_list);
 
@@ -3064,7 +3640,7 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
                 float total_distance = 0.0f;
 
 #ifdef __AVX512F__
-                if (index.jhq.M >= 64) {
+                if (index.jhq.M >= 64) { // Process very large M more efficiently
                     __m512 acc1 = _mm512_setzero_ps();
                     __m512 acc2 = _mm512_setzero_ps();
                     __m512 acc3 = _mm512_setzero_ps();
@@ -3072,11 +3648,13 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
 
                     int m = 0;
                     for (; m + 63 < index.jhq.M; m += 64) {
+                        // Prefetch next iteration
                         if (m + 128 < index.jhq.M) {
                             _mm_prefetch(&primary_codes[m + 64], _MM_HINT_T0);
                             _mm_prefetch(&jhq_primary_tables[(m + 64) * K0], _MM_HINT_T1);
                         }
 
+                        // Process 4 groups of 16 codes simultaneously
                         for (int group = 0; group < 4; ++group) {
                             const int group_offset = m + group * 16;
 
@@ -3084,6 +3662,7 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
                                 reinterpret_cast<const __m128i*>(&primary_codes[group_offset]));
                             __m512i codes_512 = _mm512_cvtepu8_epi32(codes_128);
 
+                            // Create subspace offsets more efficiently
                             __m512i offsets = _mm512_mullo_epi32(
                                 _mm512_set_epi32(15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0),
                                 _mm512_set1_epi32(K0));
@@ -3093,6 +3672,7 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
                             __m512i indices = _mm512_add_epi32(codes_512, offsets);
                             __m512 dists = _mm512_i32gather_ps(indices, jhq_primary_tables.data(), 4);
 
+                            // Accumulate in different registers to avoid dependency chains
                             switch(group) {
                                 case 0: acc1 = _mm512_add_ps(acc1, dists); break;
                                 case 1: acc2 = _mm512_add_ps(acc2, dists); break;
@@ -3102,22 +3682,26 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
                         }
                     }
 
+                    // Combine accumulators
                     __m512 combined1 = _mm512_add_ps(acc1, acc2);
                     __m512 combined2 = _mm512_add_ps(acc3, acc4);
                     __m512 final_acc = _mm512_add_ps(combined1, combined2);
                     total_distance += _mm512_reduce_add_ps(final_acc);
 
+                    // Handle remaining subspaces
                     for (; m < index.jhq.M; ++m) {
                         uint32_t code_val = primary_codes[m];
                         total_distance += jhq_primary_tables[m * K0 + code_val];
                     }
 
                 } else if (index.jhq.M >= 32) {
+                    // Optimized version for medium M values
                     __m512 acc1 = _mm512_setzero_ps();
                     __m512 acc2 = _mm512_setzero_ps();
 
                     int m = 0;
                     for (; m + 31 < index.jhq.M; m += 32) {
+                        // Process first 16
                         __m128i codes1_128 = _mm_loadu_si128(
                             reinterpret_cast<const __m128i*>(&primary_codes[m]));
                         __m512i codes1_512 = _mm512_cvtepu8_epi32(codes1_128);
@@ -3132,6 +3716,7 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
                         __m512 dists1 = _mm512_i32gather_ps(indices1, jhq_primary_tables.data(), 4);
                         acc1 = _mm512_add_ps(acc1, dists1);
 
+                        // Process second 16
                         __m128i codes2_128 = _mm_loadu_si128(
                             reinterpret_cast<const __m128i*>(&primary_codes[m + 16]));
                         __m512i codes2_512 = _mm512_cvtepu8_epi32(codes2_128);
@@ -3149,12 +3734,14 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
 
                     total_distance += _mm512_reduce_add_ps(acc1) + _mm512_reduce_add_ps(acc2);
 
+                    // Handle remaining
                     for (; m < index.jhq.M; ++m) {
                         uint32_t code_val = primary_codes[m];
                         total_distance += jhq_primary_tables[m * K0 + code_val];
                     }
 
                 } else if (index.jhq.M >= 16) {
+                    // Original AVX512 path for smaller M
                     __m512 acc = _mm512_setzero_ps();
                     int m = 0;
 
@@ -3183,6 +3770,7 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
                 } else
 #elif defined(__AVX2__)
                 if (index.jhq.M >= 32) {
+                    // Enhanced AVX2 version for larger M
                     __m256 acc1 = _mm256_setzero_ps();
                     __m256 acc2 = _mm256_setzero_ps();
                     __m256 acc3 = _mm256_setzero_ps();
@@ -3190,6 +3778,7 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
 
                     int m = 0;
                     for (; m + 31 < index.jhq.M; m += 32) {
+                        // Process 4 groups of 8 codes
                         for (int group = 0; group < 4; ++group) {
                             const int group_offset = m + group * 8;
 
@@ -3215,6 +3804,7 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
                         }
                     }
 
+                    // Combine and reduce
                     __m256 combined1 = _mm256_add_ps(acc1, acc2);
                     __m256 combined2 = _mm256_add_ps(acc3, acc4);
                     __m256 final_combined = _mm256_add_ps(combined1, combined2);
@@ -3231,11 +3821,13 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
                     }
 
                 } else if (index.jhq.M >= 16) {
+                    // Original AVX2 path
                     __m256 acc1 = _mm256_setzero_ps();
                     __m256 acc2 = _mm256_setzero_ps();
                     int m = 0;
 
                     for (; m + 15 < index.jhq.M; m += 16) {
+                        // First 8
                         __m128i codes1_64 = _mm_loadl_epi64(
                             reinterpret_cast<const __m128i*>(&primary_codes[m]));
                         __m256i codes1_256 = _mm256_cvtepu8_epi32(codes1_64);
@@ -3248,6 +3840,7 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
                         __m256 dists1 = _mm256_i32gather_ps(jhq_primary_tables.data(), indices1, 4);
                         acc1 = _mm256_add_ps(acc1, dists1);
 
+                        // Second 8
                         __m128i codes2_64 = _mm_loadl_epi64(
                             reinterpret_cast<const __m128i*>(&primary_codes[m + 8]));
                         __m256i codes2_256 = _mm256_cvtepu8_epi32(codes2_64);
@@ -3275,8 +3868,10 @@ void IVFJHQScanner::compute_primary_distances_separated_storage(
                 } else
 #endif
                 {
+                    // Scalar fallback with unrolling
                     int m = 0;
                     for (; m + 7 < index.jhq.M; m += 8) {
+                        // Unroll loop for better instruction-level parallelism
                         float sum =
                             jhq_primary_tables[m*K0 + primary_codes[m]] +
                             jhq_primary_tables[(m+1)*K0 + primary_codes[m+1]] +
@@ -3413,16 +4008,22 @@ void IVFJHQScanner::update_heap_single_candidate(
     const idx_t* ids,
     size_t& nup) const
 {
-    bool should_update = is_max_heap ? (dis > simi[0]) : (dis < simi[0]);
+    if (!passes_selector(j, ids)) {
+        return;
+    }
 
-    if (should_update) {
-        idx_t id = store_pairs ? lo_build(list_no, j) : ids[j];
-        if (is_max_heap) {
-            minheap_replace_top(k, simi, idxi, dis, id);
-        } else {
-            maxheap_replace_top(k, simi, idxi, dis, id);
+    if (is_max_heap) {
+        if (CMin<float, idx_t>::cmp(simi[0], dis)) {
+            idx_t id = get_candidate_id(j, ids);
+            faiss::heap_replace_top<CMin<float, idx_t>>(k, simi, idxi, dis, id);
+            nup++;
         }
-        nup++;
+    } else {
+        if (CMax<float, idx_t>::cmp(simi[0], dis)) {
+            idx_t id = get_candidate_id(j, ids);
+            faiss::heap_replace_top<CMax<float, idx_t>>(k, simi, idxi, dis, id);
+            nup++;
+        }
     }
 }
 
@@ -3443,13 +4044,24 @@ void IVFJHQScanner::update_heap_four_candidates(
         float distances[4] = { dist0, dist1, dist2, dist3 };
 
         for (int i = 0; i < 4; i++) {
-            bool should_update = is_max_heap ? (distances[i] > simi[0]) : (distances[i] < simi[0]);
-            if (should_update) {
-                idx_t id = store_pairs ? lo_build(list_no, saved_j[i])
-                                       : ids[saved_j[i]];
-                index.heap_batch_buffer.push_back(
-                    { distances[i], id, saved_j[i] });
+            if (!passes_selector(saved_j[i], ids)) {
+                continue;
             }
+
+            idx_t id = get_candidate_id(saved_j[i], ids);
+
+            if (is_max_heap) {
+                if (!CMin<float, idx_t>::cmp(simi[0], distances[i])) {
+                    continue;
+                }
+            } else {
+                if (!CMax<float, idx_t>::cmp(simi[0], distances[i])) {
+                    continue;
+                }
+            }
+
+            index.heap_batch_buffer.push_back(
+                { distances[i], id, saved_j[i] });
         }
 
         if (index.heap_batch_buffer.size() >= IndexIVFJHQ::HEAP_BATCH_SIZE) {
@@ -3458,16 +4070,24 @@ void IVFJHQScanner::update_heap_four_candidates(
     } else {
         float distances[4] = { dist0, dist1, dist2, dist3 };
         for (int i = 0; i < 4; i++) {
-            bool should_update = is_max_heap ? (distances[i] > simi[0]) : (distances[i] < simi[0]);
-            if (should_update) {
-                idx_t id = store_pairs ? lo_build(list_no, saved_j[i])
-                                       : ids[saved_j[i]];
-                if (is_max_heap) {
-                    minheap_replace_top(k, simi, idxi, distances[i], id);
-                } else {
-                    maxheap_replace_top(k, simi, idxi, distances[i], id);
+            if (!passes_selector(saved_j[i], ids)) {
+                continue;
+            }
+
+            idx_t id = get_candidate_id(saved_j[i], ids);
+
+            if (is_max_heap) {
+                if (CMin<float, idx_t>::cmp(simi[0], distances[i])) {
+                    faiss::heap_replace_top<CMin<float, idx_t>>(
+                        k, simi, idxi, distances[i], id);
+                    nup++;
                 }
-                nup++;
+            } else {
+                if (CMax<float, idx_t>::cmp(simi[0], distances[i])) {
+                    faiss::heap_replace_top<CMax<float, idx_t>>(
+                        k, simi, idxi, distances[i], id);
+                    nup++;
+                }
             }
         }
     }
@@ -3484,17 +4104,24 @@ void IVFJHQScanner::update_heap_sixteen_candidates(
     size_t& nup) const
 {
     for (int i = 0; i < 16; i++) {
-        bool should_update = is_max_heap ? (distances[i] > simi[0]) : (distances[i] < simi[0]);
+        if (!passes_selector(saved_j[i], ids)) {
+            continue;
+        }
 
-        if (should_update) {
-            idx_t id = store_pairs ? lo_build(list_no, saved_j[i])
-                                   : ids[saved_j[i]];
-            if (is_max_heap) {
-                minheap_replace_top(k, simi, idxi, distances[i], id);
-            } else {
-                maxheap_replace_top(k, simi, idxi, distances[i], id);
+        idx_t id = get_candidate_id(saved_j[i], ids);
+
+        if (is_max_heap) {
+            if (CMin<float, idx_t>::cmp(simi[0], distances[i])) {
+                faiss::heap_replace_top<CMin<float, idx_t>>(
+                    k, simi, idxi, distances[i], id);
+                nup++;
             }
-            nup++;
+        } else {
+            if (CMax<float, idx_t>::cmp(simi[0], distances[i])) {
+                faiss::heap_replace_top<CMax<float, idx_t>>(
+                    k, simi, idxi, distances[i], id);
+                nup++;
+            }
         }
     }
 }
@@ -3511,13 +4138,24 @@ void IVFJHQScanner::update_heap_sixteen_candidates_batched(
 {
     if (k > 32) {
         for (int i = 0; i < 16; i++) {
-            bool should_update = is_max_heap ? (distances[i] > simi[0]) : (distances[i] < simi[0]);
-            if (should_update) {
-                idx_t id = store_pairs ? lo_build(list_no, saved_j[i])
-                                       : ids[saved_j[i]];
-                index.heap_batch_buffer.push_back(
-                    { distances[i], id, saved_j[i] });
+            if (!passes_selector(saved_j[i], ids)) {
+                continue;
             }
+
+            idx_t id = get_candidate_id(saved_j[i], ids);
+
+            if (is_max_heap) {
+                if (!CMin<float, idx_t>::cmp(simi[0], distances[i])) {
+                    continue;
+                }
+            } else {
+                if (!CMax<float, idx_t>::cmp(simi[0], distances[i])) {
+                    continue;
+                }
+            }
+
+            index.heap_batch_buffer.push_back(
+                { distances[i], id, saved_j[i] });
         }
 
         if (index.heap_batch_buffer.size() >= IndexIVFJHQ::HEAP_BATCH_SIZE) {
@@ -3553,22 +4191,42 @@ void IVFJHQScanner::flush_heap_batch(bool is_max_heap,
     }
 
     for (const auto& candidate : index.heap_batch_buffer) {
-        bool should_update = is_max_heap ? (candidate.distance > simi[0])
-                                         : (candidate.distance < simi[0]);
-
-        if (should_update) {
-            if (is_max_heap) {
-                minheap_replace_top(
+        if (is_max_heap) {
+            if (CMin<float, idx_t>::cmp(simi[0], candidate.distance)) {
+                faiss::heap_replace_top<CMin<float, idx_t>>(
                     k, simi, idxi, candidate.distance, candidate.id);
-            } else {
-                maxheap_replace_top(
-                    k, simi, idxi, candidate.distance, candidate.id);
+                nup++;
             }
-            nup++;
+        } else {
+            if (CMax<float, idx_t>::cmp(simi[0], candidate.distance)) {
+                faiss::heap_replace_top<CMax<float, idx_t>>(
+                    k, simi, idxi, candidate.distance, candidate.id);
+                nup++;
+            }
         }
     }
 
     index.heap_batch_buffer.clear();
+}
+
+idx_t IVFJHQScanner::get_candidate_id(
+    size_t j,
+    const idx_t* ids) const
+{
+    if (store_pairs || ids == nullptr) {
+        return lo_build(list_no, j);
+    }
+    return ids[j];
+}
+
+bool IVFJHQScanner::passes_selector(
+    size_t j,
+    const idx_t* ids) const
+{
+    if (!sel) {
+        return true;
+    }
+    return sel->is_member(get_candidate_id(j, ids));
 }
 
 void IVFJHQScanner::ensure_workspace_capacity(
@@ -3581,6 +4239,7 @@ void IVFJHQScanner::ensure_workspace_capacity(
         size_t new_capacity = static_cast<size_t>(max_list_size * 1.3f);
         resize_workspace(
             new_capacity, workspace_primary_distances, workspace_capacity_lists);
+        workspace_primary_distances_quantized.reserve(new_capacity);
         resized = true;
     }
 
@@ -3591,6 +4250,52 @@ void IVFJHQScanner::ensure_workspace_capacity(
         workspace_capacity_candidates = new_capacity;
         resized = true;
     }
+}
+
+void IVFJHQScanner::quantize_primary_distances(size_t list_size) const
+{
+    workspace_primary_distances_quantized.clear();
+    if (list_size == 0) {
+        primary_distance_min = 0.0f;
+        primary_distance_scale = 1.0f;
+        return;
+    }
+
+    const float* distances = workspace_primary_distances.data();
+    float min_val = std::numeric_limits<float>::infinity();
+    float max_val = -std::numeric_limits<float>::infinity();
+
+    for (size_t i = 0; i < list_size; ++i) {
+        float v = distances[i];
+        min_val = std::min(min_val, v);
+        max_val = std::max(max_val, v);
+    }
+
+    primary_distance_min = min_val;
+    float range = max_val - min_val;
+    if (range <= 1e-12f) {
+        primary_distance_scale = 1.0f;
+        workspace_primary_distances_quantized.assign(list_size, 0);
+        return;
+    }
+
+    primary_distance_scale = range / 65535.0f;
+    float inv_scale = 1.0f / primary_distance_scale;
+
+    workspace_primary_distances_quantized.resize(list_size);
+    for (size_t i = 0; i < list_size; ++i) {
+        float normalized = (distances[i] - primary_distance_min) * inv_scale;
+        uint32_t quantized = static_cast<uint32_t>(
+            std::round(std::max(0.0f, std::min(65535.0f, normalized))));
+        workspace_primary_distances_quantized[i] =
+            static_cast<uint16_t>(quantized);
+    }
+}
+
+float IVFJHQScanner::reconstruct_primary_distance(uint16_t qvalue) const
+{
+    return primary_distance_min +
+        primary_distance_scale * static_cast<float>(qvalue);
 }
 
 void IVFJHQScanner::ensure_table_capacity(
@@ -3665,6 +4370,7 @@ size_t IVFJHQScanner::get_workspace_memory_usage() const
     total_bytes += workspace_primary_distances.size() * sizeof(float);
     total_bytes += workspace_candidate_indices.capacity() * sizeof(size_t);
     total_bytes += workspace_candidate_distances.capacity() * sizeof(float);
+    total_bytes += workspace_primary_distances_quantized.capacity() * sizeof(uint16_t);
     total_bytes += query_rotated.capacity() * sizeof(float);
     total_bytes += jhq_primary_tables.capacity() * sizeof(float);
     total_bytes += jhq_residual_tables.capacity() * sizeof(float);
@@ -4110,6 +4816,17 @@ IndexIVFJHQ* read_index_ivf_jhq(IOReader* f)
 
         idx->optimize_for_search();
 
+        if (idx->verbose) {
+            std::cout
+                << "Completed comprehensive state restoration after loading"
+                << std::endl;
+            std::cout << "  - JHQ residual bits per subspace: "
+                      << idx->jhq.residual_bits_per_subspace << std::endl;
+            std::cout << "  - Rotated centroids: "
+                      << (idx->rotated_centroids_computed ? "ready"
+                                                          : "on-demand")
+                      << std::endl;
+        }
     }
 
     return idx.release();
@@ -4200,6 +4917,10 @@ void IndexIVFJHQ::initialize_vector_mapping_for_new_vectors(
             list_to_global_mapping[list_no][current_list_size] = global_vec_idx;
         }
     }
+
+    if (verbose && n > 1000) {
+        printf("Vector mapping updated for %zd new vectors\n", n);
+    }
 }
 
 void IndexIVFJHQ::encode_vectors_fallback(
@@ -4208,6 +4929,7 @@ void IndexIVFJHQ::encode_vectors_fallback(
     const idx_t* list_nos,
     uint8_t* codes) const
 {
+
     jhq.sa_encode(n, x, codes);
 }
 } // namespace faiss

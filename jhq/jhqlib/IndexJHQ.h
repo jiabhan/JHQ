@@ -19,6 +19,7 @@
 #include <lapacke.h>
 #include <memory>
 #include <random>
+#include <faiss/impl/ProductQuantizer.h>
 #include <vector>
 
 #ifdef __has_include
@@ -52,10 +53,7 @@
 #define RESTRICT
 #endif
 
-namespace faiss {
-
 namespace jhq_internal {
-
 #ifdef __AVX512F__
 static constexpr bool has_avx512 = true;
 static constexpr int simd_width = 16;
@@ -66,6 +64,11 @@ static constexpr int simd_width = 8;
 static constexpr bool has_avx512 = false;
 static constexpr int simd_width = 1;
 #endif
+}
+
+namespace faiss {
+
+namespace jhq_internal {
 
 float erfinv_approx(float x);
 float fvec_L2sqr_avx512(const float* x, const float* y, size_t d);
@@ -266,6 +269,7 @@ public:
     std::vector<std::vector<std::vector<float>>> codewords;
     std::vector<std::vector<std::vector<float>>> scalar_codebooks;
 
+    mutable bool residual_pq_dirty_ = true;
     bool use_kmeans_refinement;
     int kmeans_niter;
     int kmeans_seed;
@@ -353,6 +357,11 @@ public:
         std::vector<float>& flat_tables,
         std::vector<size_t>& level_offsets) const;
 
+    mutable std::unique_ptr<ProductQuantizer> residual_pq_;
+
+    const ProductQuantizer* get_residual_product_quantizer() const;
+    void mark_residual_tables_dirty() { residual_pq_dirty_ = true; }
+
     void analytical_gaussian_init(const float* data, idx_t n, int dim, int k, float* centroids) const;
     void generate_qr_rotation_matrix(int random_seed = 1234);
 
@@ -430,8 +439,8 @@ private:
 
     void encode_to_separated_storage(idx_t n, const float* x_rotated) const;
     void encode_single_vector_separated(const float* x, idx_t vector_idx) const;
-    int find_best_centroid_fast(const float* residual, const std::vector<float>& centroids, int K) const;
-    void subtract_centroid_fast(float* residual, const std::vector<float>& centroids, int best_k) const;
+    int find_best_centroid(const float* residual, const std::vector<float>& centroids, int K) const;
+    void subtract_centroid(float* residual, const std::vector<float>& centroids, int best_k) const;
     void encode_residual_levels_separated(int m, const float* residual, uint8_t* residual_dest, size_t& offset) const;
     float compute_exact_distance_separated(idx_t vector_idx, const float* query_rotated) const;
 };
@@ -502,6 +511,17 @@ struct JHQTraits {
     static constexpr bool is_simd_friendly = (DS % 8 == 0) && (K0 % 8 == 0);
     static constexpr bool supports_avx512 = (DS >= 16) && (K0 >= 16);
 };
+
+namespace jhq_internal {
+
+float compute_cross_term_from_codes(
+    const IndexJHQ& index,
+    const uint8_t* primary_codes,
+    const uint8_t* residual_codes,
+    size_t residual_subspace_stride,
+    size_t residual_level_stride);
+
+} // namespace jhq_internal
 
 void write_index_jhq(const IndexJHQ* idx, IOWriter* f);
 IndexJHQ* read_index_jhq(IOReader* f);

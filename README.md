@@ -10,12 +10,13 @@ JHQ introduces two novel vector quantization algorithms that leverages the ortho
 - **Up to 3,600× faster index construction** (compared with Additive-based quantizers) through training-free codebook generation
 - **Superior performance** on datasets with up to 3,072 dimensions
 - **Provable error bounds** with theoretical guarantees
- 
-### Key Innovations
 
-1. **JQ Algorithm**: Training-free quantization using analytical Lloyd-Max codebooks
-2. **JHQ Algorithm**: Hierarchical architecture with selective refinement for large-scale datasets
-3. **Theoretical Foundations**: Rigorous distance preservation and error bound analysis
+
+
+## Organization of Supplementary Materials
+
+- Appendix: `appendix.pdf`
+- Source code: `/jhq`
 
 
 ## Quick Start
