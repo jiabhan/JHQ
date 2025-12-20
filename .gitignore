@@ -3,7 +3,6 @@
 ################################
 TODO*.*
 *.pptx
-*.pdf
 CMakeUserPresets.json
 *.err
 *.log
