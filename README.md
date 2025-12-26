@@ -4,7 +4,7 @@ Implementation for **VLDB 2026** submission: *JHQ: Johnson-Lindenstrauss Enhance
 
 ## Overview
 
-JHQ introduces two novel vector quantization algorithms that leverages the orthogonal **Johnson-Lindenstrauss (JL) transformation** to address critical bottlenecks in high-dimensional approximate nearest neighbor (ANN) search:
+JHQ introduces two novel vector quantization algorithms that leverages the orthogonal **Johnson-Lindenstrauss (JL) transformation** to address critical bottlenecks in high-dimensional approximate nearest neighbor (ANN) search. Main quantitative benefits include:
 
 - **3-100× query speedup** over state-of-the-art methods at ≥95% recall
 - **Up to 3,600× faster index construction** (compared with Additive-based quantizers) through training-free codebook generation
@@ -12,10 +12,9 @@ JHQ introduces two novel vector quantization algorithms that leverages the ortho
 - **Provable error bounds** with theoretical guarantees
 
 
-
 ## Organization of Supplementary Materials
 
-- Appendix: `appendix.pdf`
+- Appendix (Proofs of Lemmas and Theorems, and additional experiments further supporting the observations reported in the main paper): `appendix.pdf`
 - Source code: `/jhq`
 
 
