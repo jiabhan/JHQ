@@ -129,7 +129,7 @@ inline uint32_t hsum256_epi32(__m256i v)
 #if !defined(_WIN32)
 bool thp_debug_enabled()
 {
-    static const bool enabled = parse_env_bool("QIG_THP_DEBUG", false);
+    static const bool enabled = parse_env_bool("JHQ_THP_DEBUG", false);
     return enabled;
 }
 
@@ -2036,7 +2036,7 @@ IndexJHQ* read_index_jhq(IOReader* f)
 	    // A likely culprit is NUMA memory placement: deserialization writes large buffers single-threaded,
 	    // while steady-state search touches them from many threads. Repacking via a parallel memcpy forces
 	    // a new allocation whose pages are first-touched across threads, which can improve post-load QPS.
-    if (parse_env_bool("QIG_REPACK_ON_LOAD", true)) {
+    if (parse_env_bool("JHQ_REPACK_ON_LOAD", true)) {
         constexpr size_t kMinRepackBytes = 2u * 1024u * 1024u;
         repack_vector_parallel(idx->rotation_matrix, kMinRepackBytes);
         repack_vector_parallel(idx->rotation_matrix_bf16, kMinRepackBytes);
@@ -2050,7 +2050,7 @@ IndexJHQ* read_index_jhq(IOReader* f)
 
     // Large loaded JHQ instances can be TLB-bound until khugepaged collapses hot buffers.
     // Proactively request THP collapse to stabilize post-load QPS (especially low-ef).
-    if (parse_env_bool("QIG_THP_COLLAPSE_ON_LOAD", true)) {
+    if (parse_env_bool("JHQ_THP_COLLAPSE_ON_LOAD", true)) {
         try_collapse_thp(idx->codes.data(), idx->codes.size() * sizeof(uint8_t));
         try_collapse_thp(idx->rotation_matrix.data(), idx->rotation_matrix.size() * sizeof(float));
         try_collapse_thp(idx->rotation_matrix_transposed.data(),
@@ -2070,6 +2070,26 @@ IndexJHQ* read_index_jhq(IOReader* f)
 
 	    return idx;
 	}
+
+void postprocess_jhq_rotation_on_load(IndexJHQ* idx)
+{
+    if (!idx)
+        return;
+#if !defined(_WIN32)
+    constexpr size_t kMinRepackBytes = 2u * 1024u * 1024u;
+    if (parse_env_bool("JHQ_REPACK_ON_LOAD", true)) {
+        repack_vector_parallel(idx->rotation_matrix, kMinRepackBytes);
+        repack_vector_parallel(idx->rotation_matrix_bf16, kMinRepackBytes);
+        repack_vector_parallel(idx->rotation_matrix_transposed, kMinRepackBytes);
+    }
+    if (parse_env_bool("JHQ_THP_COLLAPSE_ON_LOAD", true)) {
+        try_collapse_thp(idx->rotation_matrix.data(), idx->rotation_matrix.size() * sizeof(float));
+        try_collapse_thp(
+            idx->rotation_matrix_transposed.data(),
+            idx->rotation_matrix_transposed.size() * sizeof(float));
+    }
+#endif
+}
 
 IndexJHQ* read_index_jhq(const char* fname)
 {

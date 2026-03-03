@@ -144,6 +144,15 @@ IndexJHQ make_jhq_model_only_for_ivf(const IndexJHQ& src)
         model.rotation_matrix = {};
     }
 
+    if (!src.rotation_matrix_transposed.empty()) {
+        model.rotation_matrix_transposed.resize(src.rotation_matrix_transposed.size());
+        std::memcpy(model.rotation_matrix_transposed.data(),
+                    src.rotation_matrix_transposed.data(),
+                    src.rotation_matrix_transposed.size() * sizeof(float));
+    } else {
+        model.rotation_matrix_transposed.clear();
+    }
+
     const size_t primary_codeword_size =
         static_cast<size_t>(src.primary_ksub()) *
         static_cast<size_t>(src.Ds);
@@ -325,6 +334,7 @@ IndexIVFJHQ* read_index_ivf_jhq(IOReader* f)
     idx->jhq.separated_codes_.clear();
     idx->jhq.memory_layout_initialized_ = false;
     idx->jhq.initialize_memory_layout();
+    postprocess_jhq_rotation_on_load(&idx->jhq);
 
     idx->ntotal = ntotal;
     idx->is_trained = is_trained;

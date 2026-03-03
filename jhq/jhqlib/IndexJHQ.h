@@ -716,4 +716,5 @@ float compute_residual_norm_sq_from_codes(
 void write_index_jhq(const IndexJHQ* idx, IOWriter* f);
 IndexJHQ* read_index_jhq(IOReader* f);
 IndexJHQ* read_index_jhq(const char* fname);
+void postprocess_jhq_rotation_on_load(IndexJHQ* idx);
 } 

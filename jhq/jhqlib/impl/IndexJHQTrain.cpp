@@ -36,9 +36,9 @@
 #include <cblas.h>
 #endif
 
-#if defined(QIG_USE_ACCELERATE)
+#if defined(JHQ_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
-#elif defined(QIG_USE_LAPACK)
+#elif defined(JHQ_USE_LAPACK)
 #include <lapacke.h>
 #endif
 
@@ -263,7 +263,7 @@ void IndexJHQ::train(idx_t n, const float* x)
 
     
     const size_t bytes_per_vector = 3ULL * static_cast<size_t>(d) * sizeof(float);
-    const size_t max_memory_bytes = jhq_internal::get_max_batch_memory_bytes("QIG_MAX_TRAIN_MEMORY_MB");
+    const size_t max_memory_bytes = jhq_internal::get_max_batch_memory_bytes("JHQ_MAX_TRAIN_MEMORY_MB");
     const idx_t batch_size = std::min(
         n,
         std::max(static_cast<idx_t>(1000),
@@ -648,9 +648,9 @@ void IndexJHQ::generate_qr_rotation_matrix(int random_seed)
     rotation_matrix.resize(static_cast<size_t>(d) * d);
     faiss::float_randn(rotation_matrix.data(), static_cast<size_t>(d) * d, random_seed);
 
-#if defined(QIG_USE_ACCELERATE)
-    
-    
+#if defined(JHQ_USE_ACCELERATE)
+
+
     {
         std::vector<float> col_major(static_cast<size_t>(d) * d);
         
@@ -691,7 +691,7 @@ void IndexJHQ::generate_qr_rotation_matrix(int random_seed)
 
         FAISS_THROW_FMT("Accelerate LAPACK QR decomposition failed with info = %d", info);
     }
-#elif defined(QIG_USE_LAPACK)
+#elif defined(JHQ_USE_LAPACK)
     {
         std::vector<float> tau(static_cast<size_t>(d));
         lapack_int info = LAPACKE_sgeqrf(
