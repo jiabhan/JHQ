@@ -25,6 +25,9 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <utility>
+
+#include <omp.h>
 
 #include <faiss/utils/prefetch.h>
 
@@ -341,10 +344,18 @@ void PreDecodedCodes::initialize(int M_val, int Ds_val, int num_levels_val, idx_
             } else {
                 residual_codes.resize(new_total * residual_stride);
             }
-            cross_terms.resize(new_total, 0.0f);
-            
+            if (same_layout) {
+                cross_terms.resize_preserve(new_total);
+            } else {
+                cross_terms.resize(new_total);
+            }
+
             if (!residual_norms.empty()) {
-                residual_norms.resize(new_total, 0.0f);
+                if (same_layout) {
+                    residual_norms.resize_preserve(new_total);
+                } else {
+                    residual_norms.resize(new_total);
+                }
             }
         } else {
             
@@ -403,9 +414,47 @@ void IndexJHQ::compress_rotation_to_bf16()
     for (size_t i = 0; i < n; ++i) {
         rotation_matrix_bf16[i] = jhq_internal::float_to_bf16(rotation_matrix[i]);
     }
-    rotation_matrix.clear();
-    rotation_matrix.shrink_to_fit();
+    rotation_matrix = {};
+    rotation_matrix_transposed = {};
     use_bf16_rotation = true;
+}
+
+void IndexJHQ::ensure_rotation_matrix_transposed()
+{
+    if (!use_jl_transform || !is_rotation_trained || d <= 0) {
+        rotation_matrix_transposed = {};
+        return;
+    }
+
+    const int dim = d;
+    const size_t expected = static_cast<size_t>(dim) * static_cast<size_t>(dim);
+    if (rotation_matrix.empty() || rotation_matrix.size() != expected) {
+        rotation_matrix_transposed = {};
+        return;
+    }
+    if (!rotation_matrix_transposed.empty() && rotation_matrix_transposed.size() == expected) {
+        return;
+    }
+
+    rotation_matrix_transposed.resize(expected);
+    const float* src = rotation_matrix.data();
+    float* dst = rotation_matrix_transposed.data();
+
+    constexpr int kBlock = 32;
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int i0 = 0; i0 < dim; i0 += kBlock) {
+        for (int j0 = 0; j0 < dim; j0 += kBlock) {
+            const int imax = std::min(i0 + kBlock, dim);
+            const int jmax = std::min(j0 + kBlock, dim);
+            for (int i = i0; i < imax; ++i) {
+                const size_t ioff = static_cast<size_t>(i) * static_cast<size_t>(dim);
+                for (int j = j0; j < jmax; ++j) {
+                    dst[static_cast<size_t>(j) * static_cast<size_t>(dim) + static_cast<size_t>(i)] =
+                        src[ioff + static_cast<size_t>(j)];
+                }
+            }
+        }
+    }
 }
 
 IndexJHQ::IndexJHQ()
@@ -490,8 +539,6 @@ IndexJHQ::IndexJHQ(const IndexJHQ& other)
     , use_analytical_init(other.use_analytical_init)
     , default_oversampling(other.default_oversampling)
     , verbose(other.verbose)
-    , rotation_matrix(other.rotation_matrix)
-    , rotation_matrix_bf16(other.rotation_matrix_bf16)
     , use_bf16_rotation(other.use_bf16_rotation)
     , is_rotation_trained(other.is_rotation_trained)
     , scalar_codebooks_flat_(other.scalar_codebooks_flat_)
@@ -512,6 +559,31 @@ IndexJHQ::IndexJHQ(const IndexJHQ& other)
     , scalar_codebooks_stride_(other.scalar_codebooks_stride_)
     , residual_codes_stride_(other.residual_codes_stride_)
 {
+    if (!other.rotation_matrix.empty()) {
+        rotation_matrix.resize(other.rotation_matrix.size());
+        std::memcpy(rotation_matrix.data(),
+                    other.rotation_matrix.data(),
+                    other.rotation_matrix.size() * sizeof(float));
+    } else {
+        rotation_matrix.clear();
+    }
+    if (!other.rotation_matrix_transposed.empty()) {
+        rotation_matrix_transposed.resize(other.rotation_matrix_transposed.size());
+        std::memcpy(rotation_matrix_transposed.data(),
+                    other.rotation_matrix_transposed.data(),
+                    other.rotation_matrix_transposed.size() * sizeof(float));
+    } else {
+        rotation_matrix_transposed.clear();
+    }
+    if (!other.rotation_matrix_bf16.empty()) {
+        rotation_matrix_bf16.resize(other.rotation_matrix_bf16.size());
+        std::memcpy(rotation_matrix_bf16.data(),
+                    other.rotation_matrix_bf16.data(),
+                    other.rotation_matrix_bf16.size() * sizeof(uint16_t));
+    } else {
+        rotation_matrix_bf16.clear();
+    }
+
     if (other.primary_pq_) {
         primary_pq_ = std::make_unique<ProductQuantizer>(*other.primary_pq_);
     }
@@ -540,12 +612,28 @@ IndexJHQ::IndexJHQ(const IndexJHQ& other)
                         other.separated_codes_.residual_codes_packed4.data(),
                         other.separated_codes_.residual_codes_packed4.size());
         }
-        separated_codes_.cross_terms = other.separated_codes_.cross_terms;
-        separated_codes_.residual_norms = other.separated_codes_.residual_norms;
+        if (!other.separated_codes_.cross_terms.empty()) {
+            separated_codes_.cross_terms.resize(other.separated_codes_.cross_terms.size());
+            std::memcpy(separated_codes_.cross_terms.data(),
+                        other.separated_codes_.cross_terms.data(),
+                        other.separated_codes_.cross_terms.size() * sizeof(float));
+        } else {
+            separated_codes_.cross_terms.clear();
+        }
+        if (!other.separated_codes_.residual_norms.empty()) {
+            separated_codes_.residual_norms.resize(other.separated_codes_.residual_norms.size());
+            std::memcpy(separated_codes_.residual_norms.data(),
+                        other.separated_codes_.residual_norms.data(),
+                        other.separated_codes_.residual_norms.size() * sizeof(float));
+        } else {
+            separated_codes_.residual_norms.clear();
+        }
     } else {
         separated_codes_.clear();
         memory_layout_initialized_ = false;
     }
+
+    ensure_rotation_matrix_transposed();
 }
 
 IndexJHQ& IndexJHQ::operator=(const IndexJHQ& other)
@@ -561,8 +649,30 @@ IndexJHQ& IndexJHQ::operator=(const IndexJHQ& other)
         use_analytical_init = other.use_analytical_init;
         default_oversampling = other.default_oversampling;
         verbose = other.verbose;
-        rotation_matrix = other.rotation_matrix;
-        rotation_matrix_bf16 = other.rotation_matrix_bf16;
+        if (!other.rotation_matrix.empty()) {
+            rotation_matrix.resize(other.rotation_matrix.size());
+            std::memcpy(rotation_matrix.data(),
+                        other.rotation_matrix.data(),
+                        other.rotation_matrix.size() * sizeof(float));
+        } else {
+            rotation_matrix.clear();
+        }
+        if (!other.rotation_matrix_transposed.empty()) {
+            rotation_matrix_transposed.resize(other.rotation_matrix_transposed.size());
+            std::memcpy(rotation_matrix_transposed.data(),
+                        other.rotation_matrix_transposed.data(),
+                        other.rotation_matrix_transposed.size() * sizeof(float));
+        } else {
+            rotation_matrix_transposed.clear();
+        }
+        if (!other.rotation_matrix_bf16.empty()) {
+            rotation_matrix_bf16.resize(other.rotation_matrix_bf16.size());
+            std::memcpy(rotation_matrix_bf16.data(),
+                        other.rotation_matrix_bf16.data(),
+                        other.rotation_matrix_bf16.size() * sizeof(uint16_t));
+        } else {
+            rotation_matrix_bf16.clear();
+        }
         use_bf16_rotation = other.use_bf16_rotation;
         is_rotation_trained = other.is_rotation_trained;
         primary_pq_dirty_ = other.primary_pq_dirty_;
@@ -614,14 +724,114 @@ IndexJHQ& IndexJHQ::operator=(const IndexJHQ& other)
                             other.separated_codes_.residual_codes_packed4.data(),
                             other.separated_codes_.residual_codes_packed4.size());
             }
-            separated_codes_.cross_terms = other.separated_codes_.cross_terms;
-            separated_codes_.residual_norms = other.separated_codes_.residual_norms;
+            if (!other.separated_codes_.cross_terms.empty()) {
+                separated_codes_.cross_terms.resize(other.separated_codes_.cross_terms.size());
+                std::memcpy(separated_codes_.cross_terms.data(),
+                            other.separated_codes_.cross_terms.data(),
+                            other.separated_codes_.cross_terms.size() * sizeof(float));
+            } else {
+                separated_codes_.cross_terms.clear();
+            }
+            if (!other.separated_codes_.residual_norms.empty()) {
+                separated_codes_.residual_norms.resize(other.separated_codes_.residual_norms.size());
+                std::memcpy(separated_codes_.residual_norms.data(),
+                            other.separated_codes_.residual_norms.data(),
+                            other.separated_codes_.residual_norms.size() * sizeof(float));
+            } else {
+                separated_codes_.residual_norms.clear();
+            }
         } else {
             separated_codes_.clear();
             memory_layout_initialized_ = false;
         }
+
+        ensure_rotation_matrix_transposed();
     }
     return *this;
+}
+
+IndexJHQ::IndexJHQ(IndexJHQ&& other) noexcept
+    : IndexJHQ()
+{
+    swap(other);
+}
+
+IndexJHQ& IndexJHQ::operator=(IndexJHQ&& other) noexcept
+{
+    if (this != &other) {
+        swap(other);
+    }
+    return *this;
+}
+
+void IndexJHQ::swap(IndexJHQ& other) noexcept
+{
+    if (this == &other) {
+        return;
+    }
+
+    using std::swap;
+
+    Index& a_base = static_cast<Index&>(*this);
+    Index& b_base = static_cast<Index&>(other);
+    swap(a_base.d, b_base.d);
+    swap(a_base.ntotal, b_base.ntotal);
+    swap(a_base.verbose, b_base.verbose);
+    swap(a_base.is_trained, b_base.is_trained);
+    swap(a_base.metric_type, b_base.metric_type);
+    swap(a_base.metric_arg, b_base.metric_arg);
+
+    IndexFlatCodes& a_flat = static_cast<IndexFlatCodes&>(*this);
+    IndexFlatCodes& b_flat = static_cast<IndexFlatCodes&>(other);
+    swap(a_flat.code_size, b_flat.code_size);
+    swap(a_flat.codes, b_flat.codes);
+
+    swap(M, other.M);
+    swap(Ds, other.Ds);
+    swap(num_levels, other.num_levels);
+    swap(level_bits, other.level_bits);
+
+    swap(use_jl_transform, other.use_jl_transform);
+    swap(normalize_l2, other.normalize_l2);
+    swap(use_analytical_init, other.use_analytical_init);
+    swap(default_oversampling, other.default_oversampling);
+    swap(verbose, other.verbose);
+
+    swap(rotation_matrix, other.rotation_matrix);
+    swap(rotation_matrix_transposed, other.rotation_matrix_transposed);
+    swap(rotation_matrix_bf16, other.rotation_matrix_bf16);
+    swap(use_bf16_rotation, other.use_bf16_rotation);
+    swap(is_rotation_trained, other.is_rotation_trained);
+
+    swap(scalar_codebooks_flat_, other.scalar_codebooks_flat_);
+    swap(scalar_codebook_level_offsets_, other.scalar_codebook_level_offsets_);
+    swap(scalar_codebooks_flat_valid_, other.scalar_codebooks_flat_valid_);
+
+    swap(residual_pq_dirty_, other.residual_pq_dirty_);
+    swap(primary_pq_dirty_, other.primary_pq_dirty_);
+
+    swap(use_kmeans_refinement, other.use_kmeans_refinement);
+    swap(kmeans_niter, other.kmeans_niter);
+    swap(kmeans_nredo, other.kmeans_nredo);
+    swap(kmeans_seed, other.kmeans_seed);
+    swap(sample_primary, other.sample_primary);
+    swap(sample_residual, other.sample_residual);
+    swap(random_sample_training, other.random_sample_training);
+
+    swap(residual_bits_per_subspace, other.residual_bits_per_subspace);
+    swap(separated_codes_, other.separated_codes_);
+
+    swap(memory_layout_initialized_, other.memory_layout_initialized_);
+    swap(primary_codewords_stride_, other.primary_codewords_stride_);
+    swap(scalar_codebooks_stride_, other.scalar_codebooks_stride_);
+    swap(residual_codes_stride_, other.residual_codes_stride_);
+
+    swap(residual_pq_, other.residual_pq_);
+    swap(primary_pq_, other.primary_pq_);
+
+    if (workspace_.owner == this || workspace_.owner == &other) {
+        workspace_ = SearchWorkspace{};
+    }
 }
 
 IndexJHQ::~IndexJHQ() = default;

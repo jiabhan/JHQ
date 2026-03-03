@@ -123,12 +123,25 @@ IndexJHQ make_jhq_model_only_for_ivf(const IndexJHQ& src)
     model.is_trained = src.is_trained;
     model.is_rotation_trained = src.is_rotation_trained;
     model.use_bf16_rotation = src.use_bf16_rotation;
-    model.rotation_matrix = src.rotation_matrix;
-    model.rotation_matrix_bf16 = src.rotation_matrix_bf16;
+    if (!src.rotation_matrix.empty()) {
+        model.rotation_matrix.resize(src.rotation_matrix.size());
+        std::memcpy(model.rotation_matrix.data(),
+                    src.rotation_matrix.data(),
+                    src.rotation_matrix.size() * sizeof(float));
+    } else {
+        model.rotation_matrix.clear();
+    }
+    if (!src.rotation_matrix_bf16.empty()) {
+        model.rotation_matrix_bf16.resize(src.rotation_matrix_bf16.size());
+        std::memcpy(model.rotation_matrix_bf16.data(),
+                    src.rotation_matrix_bf16.data(),
+                    src.rotation_matrix_bf16.size() * sizeof(uint16_t));
+    } else {
+        model.rotation_matrix_bf16.clear();
+    }
 
     if (model.use_bf16_rotation && !model.rotation_matrix_bf16.empty()) {
-        model.rotation_matrix.clear();
-        model.rotation_matrix.shrink_to_fit();
+        model.rotation_matrix = {};
     }
 
     const size_t primary_codeword_size =

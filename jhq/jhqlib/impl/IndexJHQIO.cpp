@@ -2,14 +2,23 @@
 
 #include <faiss/impl/mapped_io.h>
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <faiss/utils/distances.h>
 #include <faiss/utils/hamming.h>
 #include <iostream>
+#include <type_traits>
+#include <utility>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #ifdef __has_include
 #if __has_include(<openblas/cblas.h>)
@@ -117,9 +126,152 @@ inline uint32_t hsum256_epi32(__m256i v)
 	    return true;
 	}
 
-	} 
+#if !defined(_WIN32)
+bool thp_debug_enabled()
+{
+    static const bool enabled = parse_env_bool("QIG_THP_DEBUG", false);
+    return enabled;
+}
 
-	void IndexJHQ::write(IOWriter* f) const
+size_t page_size_bytes()
+{
+    static const size_t ps = []() -> size_t {
+        const long v = sysconf(_SC_PAGESIZE);
+        return (v > 0) ? static_cast<size_t>(v) : 4096u;
+    }();
+    return ps;
+}
+
+int madvise_with_optional_log(void* addr, size_t bytes, int advice, const char* advice_name)
+{
+    if (!addr || bytes == 0) {
+        return 0;
+    }
+    errno = 0;
+    const int rc = madvise(addr, bytes, advice);
+    if (thp_debug_enabled()) {
+        const int e = (rc == 0) ? 0 : errno;
+        std::fprintf(stderr,
+                     "madvise(%s): addr=%p bytes=%zu rc=%d errno=%d (%s)\n",
+                     advice_name ? advice_name : "?",
+                     addr,
+                     bytes,
+                     rc,
+                     e,
+                     (e != 0) ? std::strerror(e) : "");
+    }
+    return rc;
+}
+
+void try_madvise_region_page_aligned(const void* ptr, size_t bytes, int advice, const char* advice_name)
+{
+    if (!ptr || bytes == 0) {
+        return;
+    }
+    const size_t ps = page_size_bytes();
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t aligned = addr & ~(static_cast<uintptr_t>(ps) - 1u);
+    const size_t offset = static_cast<size_t>(addr - aligned);
+    size_t len = offset + bytes;
+    len = (len + ps - 1u) & ~(ps - 1u);
+    (void)madvise_with_optional_log(reinterpret_cast<void*>(aligned), len, advice, advice_name);
+}
+
+void try_madvise_region_2mb_interior(const void* ptr, size_t bytes, int advice, const char* advice_name)
+{
+    if (!ptr || bytes == 0) {
+        return;
+    }
+    constexpr uintptr_t kHugePage = 2u * 1024u * 1024u;
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t end = addr + static_cast<uintptr_t>(bytes);
+    const uintptr_t aligned_begin = (addr + kHugePage - 1u) & ~(kHugePage - 1u);
+    const uintptr_t aligned_end = end & ~(kHugePage - 1u);
+    if (aligned_end <= aligned_begin) {
+        return;
+    }
+    (void)madvise_with_optional_log(
+        reinterpret_cast<void*>(aligned_begin),
+        static_cast<size_t>(aligned_end - aligned_begin),
+        advice,
+        advice_name);
+}
+
+void try_collapse_thp(const void* ptr, size_t bytes)
+{
+    constexpr size_t kMinBytes = 2u * 1024u * 1024u;
+    if (!ptr || bytes < kMinBytes) {
+        return;
+    }
+#if defined(MADV_HUGEPAGE)
+    try_madvise_region_page_aligned(ptr, bytes, MADV_HUGEPAGE, "MADV_HUGEPAGE");
+#endif
+#if defined(MADV_COLLAPSE)
+    try_madvise_region_2mb_interior(ptr, bytes, MADV_COLLAPSE, "MADV_COLLAPSE");
+#endif
+}
+#endif
+
+template <typename T>
+void repack_vector_parallel(std::vector<T>& v, size_t min_bytes)
+{
+    static_assert(std::is_trivially_copyable_v<T>, "repack_vector_parallel requires trivially copyable T");
+
+    const size_t bytes = v.size() * sizeof(T);
+    if (bytes < min_bytes || v.empty()) {
+        return;
+    }
+
+    std::vector<T> out(v.size());
+
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(v.data());
+    uint8_t* dst = reinterpret_cast<uint8_t*>(out.data());
+
+    constexpr size_t kChunkBytes = 1u << 20;  // 1 MiB
+    const size_t chunks = (bytes + kChunkBytes - 1u) / kChunkBytes;
+
+#pragma omp parallel for schedule(static)
+    for (int64_t c = 0; c < static_cast<int64_t>(chunks); ++c) {
+        const size_t off = static_cast<size_t>(c) * kChunkBytes;
+        const size_t n = std::min(kChunkBytes, bytes - off);
+        std::memcpy(dst + off, src + off, n);
+    }
+
+    v.swap(out);
+}
+
+template <typename T, size_t Alignment>
+void repack_vector_parallel(jhq_internal::AlignedBuffer<T, Alignment>& v, size_t min_bytes)
+{
+    static_assert(std::is_trivially_copyable_v<T>, "repack_vector_parallel requires trivially copyable T");
+
+    const size_t bytes = v.size() * sizeof(T);
+    if (bytes < min_bytes || v.empty()) {
+        return;
+    }
+
+    jhq_internal::AlignedBuffer<T, Alignment> out;
+    out.resize(v.size());
+
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(v.data());
+    uint8_t* dst = reinterpret_cast<uint8_t*>(out.data());
+
+    constexpr size_t kChunkBytes = 1u << 20;  // 1 MiB
+    const size_t chunks = (bytes + kChunkBytes - 1u) / kChunkBytes;
+
+#pragma omp parallel for schedule(static)
+    for (int64_t c = 0; c < static_cast<int64_t>(chunks); ++c) {
+        const size_t off = static_cast<size_t>(c) * kChunkBytes;
+        const size_t n = std::min(kChunkBytes, bytes - off);
+        std::memcpy(dst + off, src + off, n);
+    }
+
+    v = std::move(out);
+}
+
+		} 
+
+		void IndexJHQ::write(IOWriter* f) const
 {
     write_index_jhq(this, f);
 }
@@ -1449,7 +1601,7 @@ void write_index_jhq(const IndexJHQ* idx, IOWriter* f)
 {
     uint32_t magic = 0x4A525051;
     f->operator()(&magic, sizeof(magic), 1);
-    uint32_t version = 4;
+    uint32_t version = 5;
     f->operator()(&version, sizeof(version), 1);
 
     f->operator()(&idx->d, sizeof(idx->d), 1);
@@ -1481,28 +1633,84 @@ void write_index_jhq(const IndexJHQ* idx, IOWriter* f)
     f->operator()(&idx->is_rotation_trained, sizeof(idx->is_rotation_trained), 1);
 
     if (idx->use_jl_transform && idx->is_rotation_trained) {
-        
+        const size_t expected_rotation_size = static_cast<size_t>(idx->d) * static_cast<size_t>(idx->d);
+
         if (idx->use_bf16_rotation && !idx->rotation_matrix_bf16.empty()) {
-            size_t rot_size = idx->rotation_matrix_bf16.size();
+            const size_t rot_size = idx->rotation_matrix_bf16.size();
             f->operator()(&rot_size, sizeof(rot_size), 1);
+            FAISS_THROW_IF_NOT_MSG(
+                rot_size == 0 || rot_size == expected_rotation_size,
+                "write_index_jhq: invalid rotation_matrix_bf16 size");
             if (rot_size > 0) {
-                
                 constexpr size_t CHUNK = 4096;
                 std::vector<float> buf(CHUNK);
                 for (size_t off = 0; off < rot_size; off += CHUNK) {
-                    size_t cnt = std::min(CHUNK, rot_size - off);
+                    const size_t cnt = std::min(CHUNK, rot_size - off);
                     for (size_t i = 0; i < cnt; ++i) {
-                        uint32_t bits = static_cast<uint32_t>(idx->rotation_matrix_bf16[off + i]) << 16;
+                        const uint32_t bits =
+                            static_cast<uint32_t>(idx->rotation_matrix_bf16[off + i]) << 16;
                         std::memcpy(&buf[i], &bits, sizeof(float));
                     }
                     f->operator()(buf.data(), sizeof(float), cnt);
                 }
             }
+
+            const size_t rot_t_size = rot_size;
+            f->operator()(&rot_t_size, sizeof(rot_t_size), 1);
+            FAISS_THROW_IF_NOT_MSG(
+                rot_t_size == 0 || rot_t_size == expected_rotation_size,
+                "write_index_jhq: invalid rotation_matrix_transposed payload size");
+            if (rot_t_size > 0) {
+                std::vector<float> rot_t(rot_t_size);
+                const int dim = idx->d;
+#pragma omp parallel for collapse(2) schedule(static)
+                for (int i = 0; i < dim; ++i) {
+                    for (int j = 0; j < dim; ++j) {
+                        const size_t src_off =
+                            static_cast<size_t>(i) * static_cast<size_t>(dim) + static_cast<size_t>(j);
+                        const uint32_t bits =
+                            static_cast<uint32_t>(idx->rotation_matrix_bf16[src_off]) << 16;
+                        float v = 0.0f;
+                        std::memcpy(&v, &bits, sizeof(float));
+                        rot_t[static_cast<size_t>(j) * static_cast<size_t>(dim) + static_cast<size_t>(i)] = v;
+                    }
+                }
+                f->operator()(rot_t.data(), sizeof(float), rot_t_size);
+            }
         } else {
-            size_t rot_size = idx->rotation_matrix.size();
+            const size_t rot_size = idx->rotation_matrix.size();
             f->operator()(&rot_size, sizeof(rot_size), 1);
+            FAISS_THROW_IF_NOT_MSG(
+                rot_size == 0 || rot_size == expected_rotation_size,
+                "write_index_jhq: invalid rotation_matrix size");
             if (rot_size > 0) {
                 f->operator()(idx->rotation_matrix.data(), sizeof(float), rot_size);
+            }
+
+            const size_t rot_t_size = rot_size;
+            f->operator()(&rot_t_size, sizeof(rot_t_size), 1);
+            FAISS_THROW_IF_NOT_MSG(
+                rot_t_size == 0 || rot_t_size == expected_rotation_size,
+                "write_index_jhq: invalid rotation_matrix_transposed payload size");
+            if (rot_t_size > 0) {
+                const bool can_write_transposed =
+                    !idx->rotation_matrix_transposed.empty() &&
+                    idx->rotation_matrix_transposed.size() == rot_t_size;
+                if (can_write_transposed) {
+                    f->operator()(idx->rotation_matrix_transposed.data(), sizeof(float), rot_t_size);
+                } else {
+                    std::vector<float> rot_t(rot_t_size);
+                    const int dim = idx->d;
+                    const float* src = idx->rotation_matrix.data();
+#pragma omp parallel for collapse(2) schedule(static)
+                    for (int i = 0; i < dim; ++i) {
+                        for (int j = 0; j < dim; ++j) {
+                            rot_t[static_cast<size_t>(j) * static_cast<size_t>(dim) + static_cast<size_t>(i)] =
+                                src[static_cast<size_t>(i) * static_cast<size_t>(dim) + static_cast<size_t>(j)];
+                        }
+                    }
+                    f->operator()(rot_t.data(), sizeof(float), rot_t_size);
+                }
             }
         }
     }
@@ -1630,8 +1838,8 @@ IndexJHQ* read_index_jhq(IOReader* f)
     uint32_t version = 0;
     f->operator()(&version, sizeof(version), 1);
     FAISS_THROW_IF_NOT_MSG(
-        version == 3 || version == 4,
-        "Unsupported JHQ version (expected 3 or 4)");
+        version == 5,
+        "Unsupported JHQ version (expected 5), please rebuild index");
 
     IndexJHQ* idx = new IndexJHQ();
 
@@ -1667,10 +1875,26 @@ IndexJHQ* read_index_jhq(IOReader* f)
     if (idx->use_jl_transform && idx->is_rotation_trained) {
         size_t rot_size;
         f->operator()(&rot_size, sizeof(rot_size), 1);
+        const size_t expected_rotation_size = static_cast<size_t>(idx->d) * static_cast<size_t>(idx->d);
+        FAISS_THROW_IF_NOT_MSG(
+            rot_size == 0 || rot_size == expected_rotation_size,
+            "Invalid JHQ rotation payload size");
         idx->rotation_matrix.resize(rot_size);
         if (rot_size > 0) {
             f->operator()(idx->rotation_matrix.data(), sizeof(float), rot_size);
         }
+
+        size_t rot_t_size = 0;
+        f->operator()(&rot_t_size, sizeof(rot_t_size), 1);
+        FAISS_THROW_IF_NOT_MSG(
+            rot_t_size == rot_size,
+            "Invalid JHQ rotation_matrix_transposed payload size");
+        idx->rotation_matrix_transposed.resize(rot_t_size);
+        if (rot_t_size > 0) {
+            f->operator()(idx->rotation_matrix_transposed.data(), sizeof(float), rot_t_size);
+        }
+    } else {
+        idx->rotation_matrix_transposed.clear();
     }
 
     idx->initialize_data_structures();
@@ -1783,9 +2007,9 @@ IndexJHQ* read_index_jhq(IOReader* f)
         }
     }
 
-    if (version >= 4) {
-        size_t residual_norms_size = 0;
-        f->operator()(&residual_norms_size, sizeof(residual_norms_size), 1);
+	    if (version >= 4) {
+	        size_t residual_norms_size = 0;
+	        f->operator()(&residual_norms_size, sizeof(residual_norms_size), 1);
         FAISS_THROW_IF_NOT_MSG(
             residual_norms_size == 0 || residual_norms_size == static_cast<size_t>(idx->ntotal),
             "Invalid JHQ residual_norms payload size");
@@ -1794,7 +2018,7 @@ IndexJHQ* read_index_jhq(IOReader* f)
             f->operator()(idx->separated_codes_.residual_norms.data(), sizeof(float), residual_norms_size);
         } else if (idx->num_levels == 2 && idx->has_pre_decoded_codes()) {
             
-            idx->separated_codes_.residual_norms.resize(static_cast<size_t>(idx->ntotal), 0.0f);
+            idx->separated_codes_.residual_norms.resize(static_cast<size_t>(idx->ntotal));
 #pragma omp parallel for schedule(static, 1024) if (idx->ntotal > 10000)
             for (idx_t i = 0; i < idx->ntotal; ++i) {
                 idx->separated_codes_.residual_norms[i] =
@@ -1804,11 +2028,48 @@ IndexJHQ* read_index_jhq(IOReader* f)
                         idx->separated_codes_.residual_subspace_stride,
                         idx->separated_codes_.residual_level_stride);
             }
-        }
+	        }
+	    }
+
+#if !defined(_WIN32)
+	    // Similar to QNG graph data, some hosts show a persistent build-vs-load QPS gap even after warmups.
+	    // A likely culprit is NUMA memory placement: deserialization writes large buffers single-threaded,
+	    // while steady-state search touches them from many threads. Repacking via a parallel memcpy forces
+	    // a new allocation whose pages are first-touched across threads, which can improve post-load QPS.
+    if (parse_env_bool("QIG_REPACK_ON_LOAD", true)) {
+        constexpr size_t kMinRepackBytes = 2u * 1024u * 1024u;
+        repack_vector_parallel(idx->rotation_matrix, kMinRepackBytes);
+        repack_vector_parallel(idx->rotation_matrix_bf16, kMinRepackBytes);
+        repack_vector_parallel(idx->rotation_matrix_transposed, kMinRepackBytes);
+        repack_vector_parallel(idx->separated_codes_.primary_codes, kMinRepackBytes);
+        repack_vector_parallel(idx->separated_codes_.residual_codes, kMinRepackBytes);
+        repack_vector_parallel(idx->separated_codes_.residual_codes_packed4, kMinRepackBytes);
+        repack_vector_parallel(idx->separated_codes_.cross_terms, kMinRepackBytes);
+        repack_vector_parallel(idx->separated_codes_.residual_norms, kMinRepackBytes);
     }
 
-    return idx;
-}
+    // Large loaded JHQ instances can be TLB-bound until khugepaged collapses hot buffers.
+    // Proactively request THP collapse to stabilize post-load QPS (especially low-ef).
+    if (parse_env_bool("QIG_THP_COLLAPSE_ON_LOAD", true)) {
+        try_collapse_thp(idx->codes.data(), idx->codes.size() * sizeof(uint8_t));
+        try_collapse_thp(idx->rotation_matrix.data(), idx->rotation_matrix.size() * sizeof(float));
+        try_collapse_thp(idx->rotation_matrix_transposed.data(),
+                         idx->rotation_matrix_transposed.size() * sizeof(float));
+        try_collapse_thp(idx->separated_codes_.primary_codes.data(),
+                         idx->separated_codes_.primary_codes.size() * sizeof(uint8_t));
+        try_collapse_thp(idx->separated_codes_.residual_codes.data(),
+                         idx->separated_codes_.residual_codes.size() * sizeof(uint8_t));
+        try_collapse_thp(idx->separated_codes_.residual_codes_packed4.data(),
+                         idx->separated_codes_.residual_codes_packed4.size() * sizeof(uint8_t));
+        try_collapse_thp(idx->separated_codes_.cross_terms.data(),
+                         idx->separated_codes_.cross_terms.size() * sizeof(float));
+        try_collapse_thp(idx->separated_codes_.residual_norms.data(),
+                         idx->separated_codes_.residual_norms.size() * sizeof(float));
+    }
+#endif
+
+	    return idx;
+	}
 
 IndexJHQ* read_index_jhq(const char* fname)
 {
@@ -1860,7 +2121,7 @@ void IndexJHQ::encode_to_separated_storage(idx_t n, const float* x_rotated) cons
     if (num_levels > 1 && metric_type == METRIC_L2) {
         const bool compute_norms = (num_levels == 2);
         if (compute_norms) {
-            separated_codes_.residual_norms.resize(static_cast<size_t>(old_total + n), 0.0f);
+            separated_codes_.residual_norms.resize_preserve(static_cast<size_t>(old_total + n));
         }
         
         

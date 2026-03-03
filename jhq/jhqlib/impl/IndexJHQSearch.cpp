@@ -1777,7 +1777,7 @@ void IndexJHQ::extract_all_codes_after_add(
 
     separated_codes_.initialize(M, Ds, num_levels, ntotal);
     if (compute_residual_norms && num_levels == 2) {
-        separated_codes_.residual_norms.resize(static_cast<size_t>(ntotal), 0.0f);
+        separated_codes_.residual_norms.resize(static_cast<size_t>(ntotal));
     }
 
     residual_bits_per_subspace = 0;
@@ -1858,6 +1858,7 @@ size_t IndexJHQ::get_memory_usage() const
 
     if (use_jl_transform) {
         total_bytes += rotation_matrix.size() * sizeof(float);
+        total_bytes += rotation_matrix_transposed.size() * sizeof(float);
         total_bytes += rotation_matrix_bf16.size() * sizeof(uint16_t);
     }
 
@@ -1881,6 +1882,7 @@ void IndexJHQ::reset()
     is_rotation_trained = false;
 
     rotation_matrix.clear();
+    rotation_matrix_transposed.clear();
     rotation_matrix_bf16.clear();
     use_bf16_rotation = false;
 

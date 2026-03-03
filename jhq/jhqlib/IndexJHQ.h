@@ -225,8 +225,8 @@ struct PreDecodedCodes {
     AlignedBuffer<uint8_t> primary_codes;
     AlignedBuffer<uint8_t> residual_codes;
     AlignedBuffer<uint8_t> residual_codes_packed4;
-    std::vector<float> cross_terms;
-    std::vector<float> residual_norms;  
+    AlignedBuffer<float> cross_terms;
+    AlignedBuffer<float> residual_norms;
 
     size_t primary_stride;
     size_t residual_stride;
@@ -339,8 +339,9 @@ public:
     float default_oversampling;
     bool verbose;
 
-    std::vector<float> rotation_matrix;
-    std::vector<uint16_t> rotation_matrix_bf16;
+    jhq_internal::AlignedBuffer<float> rotation_matrix;
+    jhq_internal::AlignedBuffer<float> rotation_matrix_transposed;
+    jhq_internal::AlignedBuffer<uint16_t> rotation_matrix_bf16;
     bool use_bf16_rotation = false;
     bool is_rotation_trained;
 
@@ -384,6 +385,9 @@ public:
 
     IndexJHQ(const IndexJHQ& other);
     IndexJHQ& operator=(const IndexJHQ& other);
+    IndexJHQ(IndexJHQ&& other) noexcept;
+    IndexJHQ& operator=(IndexJHQ&& other) noexcept;
+    void swap(IndexJHQ& other) noexcept;
     virtual ~IndexJHQ();
 
     void train(idx_t n, const float* x) override;
@@ -423,6 +427,7 @@ public:
     size_t get_memory_usage() const;
 
     void compress_rotation_to_bf16();
+    void ensure_rotation_matrix_transposed();
 
     void apply_jl_rotation(idx_t n, const float* x_in, float* x_out) const;
 

@@ -641,6 +641,7 @@ void IndexJHQ::generate_qr_rotation_matrix(int random_seed)
 {
     if (!use_jl_transform) {
         is_rotation_trained = true;
+        ensure_rotation_matrix_transposed();
         return;
     }
 
@@ -684,6 +685,7 @@ void IndexJHQ::generate_qr_rotation_matrix(int random_seed)
                 }
             }
             is_rotation_trained = true;
+            ensure_rotation_matrix_transposed();
             return;
         }
 
@@ -707,6 +709,7 @@ void IndexJHQ::generate_qr_rotation_matrix(int random_seed)
         }
 
         is_rotation_trained = true;
+        ensure_rotation_matrix_transposed();
     }
 #else
     FAISS_THROW_MSG(
@@ -812,11 +815,24 @@ void IndexJHQ::apply_jl_rotation(idx_t n, const float* x_in, float* x_out) const
 
     
     
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-        static_cast<int>(n), d, d,
-        1.0f, x_in, d,
-        rotation_ptr, d,
-        0.0f, x_out, d);
+    const bool can_use_transposed =
+        !rotation_matrix_transposed.empty() &&
+        rotation_matrix_transposed.size() == expected_rotation_size &&
+        rotation_ptr == rotation_matrix.data();
+
+    if (can_use_transposed) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+            static_cast<int>(n), d, d,
+            1.0f, x_in, d,
+            rotation_matrix_transposed.data(), d,
+            0.0f, x_out, d);
+    } else {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+            static_cast<int>(n), d, d,
+            1.0f, x_in, d,
+            rotation_ptr, d,
+            0.0f, x_out, d);
+    }
 }
 
 void IndexJHQ::initialize_memory_layout()
